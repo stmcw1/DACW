@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="DACW">
+  <defs>
+    <linearGradient id="dacw-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2f3a4f"/>
+      <stop offset="1" stop-color="#15202f"/>
+    </linearGradient>
+    <linearGradient id="dacw-shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7cb6ff"/>
+      <stop offset="1" stop-color="#4f7cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#dacw-bg)"/>
+  <path d="M32 8 L52 15 L52 31 C52 42 44 51 32 56 C20 51 12 42 12 31 L12 15 Z"
+        fill="none" stroke="url(#dacw-shield)" stroke-width="3.5" stroke-linejoin="round"/>
+  <path d="M25 24 L18.5 32 L25 40" fill="none" stroke="#e8f1ff" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M39 24 L45.5 32 L39 40" fill="none" stroke="#e8f1ff" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M35 20 L29 44" fill="none" stroke="#8fd3a8" stroke-width="3" stroke-linecap="round"/>
+</svg>

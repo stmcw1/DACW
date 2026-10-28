@@ -1,0 +1,39 @@
+{
+  "name": "@stmcw1/dacw",
+  "version": "1.0.0",
+  "description": "Defensive Agent Coding Workflow (DACW) as a DSH Host plugin: an AI writer proposes code, a deterministic runner tests it, a separate reviewer audits it, and a human gate decides the merge.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/plugin.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "dist/index.js",
+    "dist/plugin.js",
+    "dist/runner.js",
+    "dist/state_manager.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README_EN.md",
+    "SAFETY.md",
+    "SAFETY_EN.md"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "pretest": "node build.mjs",
+    "test": "node selftest.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+dacw-state/
+.virtual-ws/
+*.log
+.env
