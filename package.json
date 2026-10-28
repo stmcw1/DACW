@@ -12,13 +12,13 @@
     "ai",
     "plugin"
   ],
-  "homepage": "https://github.com/stmcw1/DSH_workspace#readme",
+  "homepage": "https://github.com/stmcw1/DACW#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/stmcw1/DSH_workspace.git"
+    "url": "git+https://github.com/stmcw1/DACW.git"
   },
   "bugs": {
-    "url": "https://github.com/stmcw1/DSH_workspace/issues"
+    "url": "https://github.com/stmcw1/DACW/issues"
   },
   "author": "stmcw1 <stmcw@163.com>",
   "license": "MIT",

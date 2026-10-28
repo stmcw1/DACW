@@ -126,4 +126,4 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 
 本项目基于 [MIT](LICENSE) 许可证开源。
 
-<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DSH_workspace">GitHub</a></p>
+<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DACW">GitHub</a></p>

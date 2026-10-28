@@ -126,4 +126,4 @@ Experimental developer preview (current version `v1.0.1`, bundle `@stmcw1/dacw`)
 
 Released under the [MIT](LICENSE) license.
 
-<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DSH_workspace">GitHub</a></p>
+<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DACW">GitHub</a></p>
