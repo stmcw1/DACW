@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DACW — Defensive Agent Coding Workflow",
+    "description": "Writer → deterministic runner → separate reviewer → human gate. The dacw_run tool writes, tests and audits code in an isolated workspace; nothing is merged without human review."
+  }
+}

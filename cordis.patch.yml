@@ -1,0 +1,17 @@
+# DACW bundle patch: inserts one Host plugin row.
+# `id` is the stable row id used by the profile patch layers; `name` resolves to
+# this package. `config` values are merged over the plugin's built-in defaults;
+# every field lives in plugin.ts (DEFAULT_PLUGIN_CONFIG), and README.md covers
+# the main knobs and the writer/reviewer model configuration.
+- insert:
+    - id: dacw
+      name: '@stmcw1/dacw'
+      config:
+        toolName: dacw_run
+        workspace: ''
+        workspacePolicy: guarded
+        maxRounds: 3
+        subagentProvider: spawn
+        # 可选：写手/审查者模型（默认继承父会话路由）
+        # writerModel: deepseek-account/deepseek-flash   # 或 "deepseek-flash" 按 DSH 已配置模型目录解析 / "inherit"
+        # reviewerModel: { model: deepseek-flash, reasoningEffort: high }
