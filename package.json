@@ -2,7 +2,7 @@
   "name": "@stmcw1/dacw",
   "version": "1.0.0",
   "description": "Defensive Agent Coding Workflow (DACW) as a DSH Host plugin: an AI writer proposes code, a deterministic runner tests it, a separate reviewer audits it, and a human gate decides the merge.",
-  "private": true,
+  "private": false,
   "type": "module",
   "exports": {
     ".": "./dist/plugin.js",
