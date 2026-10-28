@@ -2,6 +2,26 @@
   "name": "@stmcw1/dacw",
   "version": "1.0.0",
   "description": "Defensive Agent Coding Workflow (DACW) as a DSH Host plugin: an AI writer proposes code, a deterministic runner tests it, a separate reviewer audits it, and a human gate decides the merge.",
+  "keywords": [
+    "dacw",
+    "dsh",
+    "deepseek-harness",
+    "coding-agent",
+    "agent-workflow",
+    "code-review",
+    "ai",
+    "plugin"
+  ],
+  "homepage": "https://github.com/stmcw1/DSH_workspace#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stmcw1/DSH_workspace.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stmcw1/DSH_workspace/issues"
+  },
+  "author": "stmcw1 <stmcw@163.com>",
+  "license": "MIT",
   "private": false,
   "type": "module",
   "exports": {
@@ -20,7 +40,8 @@
     "README.md",
     "README_EN.md",
     "SAFETY.md",
-    "SAFETY_EN.md"
+    "SAFETY_EN.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=22.13"
@@ -30,6 +51,9 @@
     "prepack": "node build.mjs",
     "pretest": "node build.mjs",
     "test": "node selftest.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dsh": {
     "bundle": {
