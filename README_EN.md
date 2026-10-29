@@ -109,7 +109,7 @@ DACW executes model-generated code and commands and is **not a container-grade s
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
 | `state_manager.ts` | State: atomic writes, HMAC, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |
-| `cordis.patch.yml` / `locale/` / `icon.svg` | Plugin manifest and display resources |
+| `cordis.patch.yml` / `locale/` / `icon.png` | Plugin manifest and display resources |
 
 ## Development
 

@@ -109,7 +109,7 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 | `runner.ts` | 运行机：命令解析、超时强杀、输出截断 |
 | `state_manager.ts` | 状态：原子写、HMAC、串行队列 |
 | `build.mjs` / `selftest.mjs` | 构建（TS → `dist/`）与回归自测 |
-| `cordis.patch.yml` / `locale/` / `icon.svg` | 插件清单与展示资源 |
+| `cordis.patch.yml` / `locale/` / `icon.png` | 插件清单与展示资源 |
 
 ## 开发
 
