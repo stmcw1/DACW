@@ -109,7 +109,7 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 | `runner.ts` | 运行机：命令解析、超时强杀、输出截断 |
 | `state_manager.ts` | 状态：原子写、HMAC、串行队列 |
 | `build.mjs` / `selftest.mjs` | 构建（TS → `dist/`）与回归自测 |
-| `cordis.patch.yml` / `locale/` / `icon.svg` | 插件清单与展示资源 |
+| `cordis.patch.yml` / `locale/` / `icon.png` | 插件清单与展示资源 |
 
 ## 开发
 
@@ -120,7 +120,7 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 
 ## 状态
 
-实验性开发者预览（当前版本 `v1.0.1`，bundle `@stmcw1/dacw`）：构建冒烟与回归自测通过，并已在 DSH `desktop` profile 完成真实闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`），子代理工具隔离实测生效。欢迎 issue / PR。
+实验性开发者预览（当前版本 `v1.0.2`，bundle `@stmcw1/dacw`）：构建冒烟与回归自测通过，并已在 DSH `desktop` profile 完成真实闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`），子代理工具隔离实测生效。欢迎 issue / PR。
 
 ## 许可证
 

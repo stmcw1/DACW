@@ -109,7 +109,7 @@ DACW executes model-generated code and commands and is **not a container-grade s
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
 | `state_manager.ts` | State: atomic writes, HMAC, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |
-| `cordis.patch.yml` / `locale/` / `icon.svg` | Plugin manifest and display resources |
+| `cordis.patch.yml` / `locale/` / `icon.png` | Plugin manifest and display resources |
 
 ## Development
 
@@ -120,7 +120,7 @@ DACW executes model-generated code and commands and is **not a container-grade s
 
 ## Status
 
-Experimental developer preview (current version `v1.0.1`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass, and a live loop has been verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`), with child tool isolation measured in effect. Issues and PRs are welcome.
+Experimental developer preview (current version `v1.0.2`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass, and a live loop has been verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`), with child tool isolation measured in effect. Issues and PRs are welcome.
 
 ## License
 
