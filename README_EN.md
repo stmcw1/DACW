@@ -120,10 +120,10 @@ DACW executes model-generated code and commands and is **not a container-grade s
 
 ## Status
 
-Experimental developer preview (current version `v1.0.0`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass, and a live loop has been verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`), with child tool isolation measured in effect. Issues and PRs are welcome.
+Experimental developer preview (current version `v1.0.1`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass, and a live loop has been verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`), with child tool isolation measured in effect. Issues and PRs are welcome.
 
 ## License
 
 Released under the [MIT](LICENSE) license.
 
-<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DSH_workspace">GitHub</a></p>
+<p align="right">npm: <code>@stmcw1/dacw</code> · <a href="https://github.com/stmcw1/DACW">GitHub</a></p>
