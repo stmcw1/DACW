@@ -51,7 +51,7 @@ node selftest.mjs                           # 60 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
-在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.0.0.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——目录安装会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
+在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.0.2.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——目录安装会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
 
 升级：改代码 → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` 同一 tarball → 重启 Harness。
 
