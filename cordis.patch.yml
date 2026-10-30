@@ -12,6 +12,14 @@
         workspacePolicy: guarded
         maxRounds: 3
         subagentProvider: spawn
+        # 测试执行策略（默认 host：宿主直执，无隔离；auto/docker 为可选容器模式，sandbox 分支开发）
+        # sandbox:
+        #   mode: host          # host（默认）| auto | docker（显式写 host 会有一条红色警告，默认值不告警）
+        #   image: ''           # 空 = 按测试命令自动选择官方镜像；也可固定如 node:22-bookworm-slim
+        #   memoryMb: 1024
+        #   cpus: 1
+        #   pidsLimit: 256
+        #   tmpfsMb: 128
         # 可选：写手/审查者模型（默认继承父会话路由）
         # writerModel: deepseek-account/deepseek-flash   # 或 "deepseek-flash" 按 DSH 已配置模型目录解析 / "inherit"
         # reviewerModel: { model: deepseek-flash, reasoningEffort: high }

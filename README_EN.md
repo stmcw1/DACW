@@ -14,6 +14,7 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 
 - **Separation of powers**: the writer only emits a JSON changeset, the runner only executes whitelisted commands, the reviewer only emits a verdict — no single party can merge code.
 - **Zero-tool child isolation**: writer/reviewer run on persona-only presets; on `agent/created` the plugin uses `ctx.tools.restrict({ allow: [] })` to strip every inherited tool and verifies the child sees zero tools. If isolation fails, the child is never created.
+- **Configurable execution (host by default)**: `sandbox.mode` defaults to `"host"` — tests run writer-produced code with host-user privileges (no isolation). Set `"docker"` / `"auto"` to enable a one-shot container (no network, read-only root filesystem, non-root, cap-drop ALL, resource-limited; sandbox branch).
 - **Output protocol v2**: the writer emits only deltas against the baseline, untouched files are preserved byte-for-byte, which cuts tokens and prevents "the code that passed last round got broken" regressions.
 - **Deterministic runner**: command whitelist (npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go), environment whitelist, timeout tree-kill, output truncation.
 - **Structured review**: the verdict must be exact JSON; unparseable output is treated as REJECTED; PASS containing suspicious wording goes to the human gate.
@@ -21,31 +22,33 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 - **Workspace safety gate**: accepts only an empty directory or a valid `.dacw-workspace` marker written by this plugin; refuses filesystem roots, the user home directory, and `DSH_HOME`/profile directories; writes are checked with realpath plus per-segment symlink checks.
 - **Audit record**: the state file records the task, file manifest summary, test output and review text, signed with HMAC-SHA256.
 
+> **Trust boundary**: tests execute before any review, so review is a detective control, not a preventive one; child tool isolation is not a code-execution security boundary. See [SAFETY_EN.md](SAFETY_EN.md).
+
 ## How it works
 
 ```
 Writer (JSON changeset) → Orchestrator (validate / merge / write) → Runner (project tests)
                                                                     │ failure → rewrite (up to maxRounds)
-                                                            Reviewer (JSON verdict) → human gate NEED_HUMAN
+                                                              Reviewer (JSON verdict) → human gate NEED_HUMAN
 ```
 
 1. The writer emits deltas under protocol v2.
 2. The orchestrator escape-checks paths, merges the baseline, and resets the workspace to the merged set.
-3. The runner executes tests by project type (re-sniffed every round).
+3. The runner executes tests by project type (re-sniffed every round) — **this is the first execution of writer-produced code, and it happens before review**.
 4. The reviewer audits the full file set plus foundation files (lockfiles as SHA256 digests).
 5. On PASS the tool returns `success: true` and `status: "NEED_HUMAN"`; every other path also converges to the human gate.
 
 ## Install
 
-Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` provider (`@deepseek-ai/dsh-subagent-spawn-in-process`); Node ≥ 22.13 for the build; the tested project's dependencies must be installed manually.
+Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` provider (`@deepseek-ai/dsh-subagent-spawn-in-process`); Node ≥ 22.13 for the build; tests run on the host by default (no isolation, requires a working npm / pytest toolchain) — for container isolation install Docker and set `sandbox.mode: "docker"`/`"auto"` (sandbox branch); the tested project's dependencies must be installed manually.
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 60 regression vectors
+node selftest.mjs                           # 84 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
-In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.0.2.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
+In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.0.0.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
 
 Upgrade: edit sources → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` the same tarball → restart the Harness.
 
@@ -77,6 +80,29 @@ Example startup log line:
 
 On workflow failure the tool throws (including workspace, status, round and log tail) instead of returning a normal failure result; no path commits or merges anything.
 
+## Sandbox configuration
+
+`config.sandbox` decides where tests execute (default `host`): with no configuration tests run on the host (no isolation); explicitly setting `mode: "host"` produces a red startup warning, while the default value does not warn.
+
+| Mode | Behavior |
+|---|---|
+| `host` (default) | Run on the host: writer-produced code runs with host-user privileges (no isolation; the result message states where tests executed) |
+| `docker` | Optional (sandbox branch): force a one-shot container; fail at startup when Docker is unavailable |
+| `auto` | Optional (sandbox branch): Docker available → one-shot container; unavailable → tests refused (fail-closed, workflow goes to the human gate) |
+
+```yaml
+config:
+  sandbox:
+    mode: host                # host (default) | auto | docker
+    image: ''                 # empty = pick an official image per test command; or pin e.g. node:22-bookworm-slim
+    memoryMb: 1024
+    cpus: 1                   # fractions allowed
+    pidsLimit: 256
+    tmpfsMb: 128
+```
+
+Container constraints in docker mode (sandbox branch): `--network none` (no network), read-only root filesystem (only a /tmp tmpfs is writable), non-root (uid/gid 1000), `--cap-drop ALL`, `no-new-privileges`, memory / CPU / PID limits, `--rm` one-shot; the workspace is copied into a disposable staging directory and that copy is mounted — the host workspace itself never enters the container. Pre-pull the image on first use (node default `node:22-bookworm-slim`, python `python:3.12-slim`, cargo `rust:1-slim`, go `golang:1.23-bookworm`).
+
 ## Model configuration
 
 `writerModel` / `reviewerModel` accept four forms:
@@ -98,7 +124,15 @@ Resolution happens at the start of every tool call, so DSH settings changes appl
 
 ## Safety
 
-DACW executes model-generated code and commands and is **not a container-grade sandbox**. Run it in a disposable or dedicated environment under a least-privilege account, and always keep the human gate. See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries and disclaimer.
+By default DACW does not isolate: tests run writer-produced code with host-user privileges. Container isolation is an optional configuration (sandbox branch).
+
+DACW executes model-generated code and commands. **Tests execute before any review**, so review (including the human gate) is a detective control, not a pre-execution security barrier; child tool isolation is not a code-execution security boundary.
+
+- Default `sandbox.mode: "host"`: arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user — a design choice of the current mainline.
+- Setting `sandbox.mode: "docker"` or `"auto"` enables a one-shot container; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
+- Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
+
+See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and disclaimer.
 
 ## Project layout
 
@@ -106,6 +140,7 @@ DACW executes model-generated code and commands and is **not a container-grade s
 |---|---|
 | `plugin.ts` | DSH Host half: tool registration, child presets, runtime tool isolation, model resolution, workspace gate |
 | `index.ts` | Orchestrator: rounds, baseline merge, runner dispatch, verdict, human gate |
+| `sandbox.ts` | Sandbox policy: host (default)/docker/blocked decision, container args, Docker detection |
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
 | `state_manager.ts` | State: atomic writes, HMAC, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |
@@ -115,12 +150,12 @@ DACW executes model-generated code and commands and is **not a container-grade s
 
 - `dist/` is produced by `build.mjs` with Node built-in type stripping; it needs no `typescript` and is not committed.
 - Run `node build.mjs && node selftest.mjs` before submitting changes.
-- Every config field and its default lives in `DEFAULT_PLUGIN_CONFIG` in `plugin.ts` (each can be overridden in the `config` block of `cordis.patch.yml`).
+- Every config field and its default lives in `DEFAULT_PLUGIN_CONFIG` in `plugin.ts` (each can be overridden in the `config` block of `cordis.patch.yml`); sandbox defaults live in `DEFAULT_SANDBOX_CONFIG` in `sandbox.ts`.
 - Experimental project; interfaces and behavior may change.
 
 ## Status
 
-Experimental developer preview (current version `v1.0.2`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass, and a live loop has been verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`), with child tool isolation measured in effect. Issues and PRs are welcome.
+Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass. The default execution policy is host (no isolation); one-shot container execution (`docker`/`auto`) is developed on the sandbox branch. The v1.0.2 live host-execution loop verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`, child tool isolation measured in effect) still holds under the default configuration. Issues and PRs are welcome.
 
 ## License
 

@@ -10,7 +10,13 @@
  *   1. 工作区内容恒等于「基线合并集」，任何时候都不先清空再等待；
  *   2. changed / deleted 均做词法越权校验；地基文件与高危目录禁止删除；
  *   3. 所有终止路径收敛到 NEED_HUMAN，绝不自动合入；
- *   4. 裁决必须为精确 JSON，解析失败一律按 REJECTED 处理。
+ *   4. 裁决必须为精确 JSON，解析失败一律按 REJECTED 处理；
+ *   5. 测试在任何审查之前执行——审查是侦探性控制不是预防性控制，因此测试的
+ *      执行位置由 sandbox 策略层决定：默认宿主直执（无隔离），容器模式为可选配置
+ *      （见 sandbox.ts）；
+ *   6. 审查对象 === 最终交付物：测试通过后必须重新枚举工作区与基线对账，任何无法
+ *      解释的新增/删除/内容变更一律转人工（success:false），审查输入只来自对账后的
+ *      最终清单。
  */
 import * as path from 'path';
 import * as os from 'os';
@@ -19,6 +25,8 @@ import * as fsSync from 'fs';
 import * as crypto from 'crypto';
 import { Runner } from './runner';
 import { StateManager } from './state_manager';
+import { DEFAULT_SANDBOX_CONFIG, describePolicy, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
+import type { SandboxConfig } from './sandbox';
 
 /**
  * 协调器对宿主的最小依赖面。
@@ -49,6 +57,10 @@ export interface EngineOptions {
     roleModels: { writer: string; reviewer: string } | null;
     /** 状态文件目录；null 表示 `os.tmpdir()/dacw-state`。 */
     stateDir: string | null;
+    /** 测试执行策略：默认 host（宿主直执，无隔离）；容器模式为可选配置（sandbox 分支）。 */
+    sandbox: SandboxConfig;
+    /** 用户是否显式配置了 sandbox.mode="host"（用于日志分级：显式 → 红色警告；默认值 → 普通提示）。 */
+    sandboxExplicit: boolean;
 }
 
 export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
@@ -63,6 +75,8 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
     reviewFileMaxChars: 200_000,
     roleModels: null,
     stateDir: null,
+    sandbox: DEFAULT_SANDBOX_CONFIG,
+    sandboxExplicit: false,
 };
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -91,11 +105,15 @@ export function resolveEngineOptions(partial?: Partial<EngineOptions> | null): E
         reviewFileMaxChars: positiveInt(partial.reviewFileMaxChars, DEFAULT_ENGINE_OPTIONS.reviewFileMaxChars),
         roleModels,
         stateDir: typeof stateDir === 'string' && stateDir.trim() !== '' ? stateDir : null,
+        sandbox: normalizeSandboxConfig(partial.sandbox, [], 'sandbox'),
+        sandboxExplicit: partial.sandboxExplicit === true,
     };
 }
 
 const FOUNDATION_REVIEW_FILES = ['package.json', 'pyproject.toml', 'setup.py', 'Cargo.toml', 'go.mod', 'tsconfig.json'];
 const LOCK_REVIEW_DIGEST_FILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'poetry.lock'];
+/** 锁文件审查策略：只送 SHA256 摘要，不送全文（与下方摘要循环保持一致）。 */
+const LOCK_REVIEW_DIGEST_SET = new Set(LOCK_REVIEW_DIGEST_FILES);
 
 // [共享] 清理白名单（地基保护）：safeCleanWorkspace 保留 / mergeDelta 删除拦截 共用一份清单
 // `.dacw-workspace` 是 DACW 自己的目录标记，随工作区一起保留，不参与基线合并。
@@ -343,6 +361,76 @@ async function safeCleanWorkspace(workspaceDir: string) {
     }
 }
 
+// ================= 测试后对账（安全不变量 6：审查对象 === 最终交付物） =================
+/**
+ * 对账时应忽略的工作区成员：版本库、人工预置的依赖、DACW 自己的工作区标记。
+ * 这是最小忽略集——除此之外的一切都必须是「基线声明或测试前已存在」，多一个文件也算差异。
+ */
+const WORKSPACE_DIGEST_IGNORED = new Set(['.git', 'node_modules', '.dacw-workspace']);
+
+/**
+ * 递归枚举工作区，返回「相对路径（统一用 / 分隔）→ 文件内容 SHA256」。
+ * 安全语义：遇到符号链接或非普通文件项直接抛错（fail-closed）——对账对象必须可
+ * 完整、确定地枚举；忽略集仅 WORKSPACE_DIGEST_IGNORED。
+ */
+export async function enumerateWorkspace(root: string): Promise<Map<string, string>> {
+    const resolvedRoot = path.resolve(root);
+    const rootStat = await fs.lstat(resolvedRoot);
+    if (rootStat.isSymbolicLink()) throw new Error(`[安全拦截] 工作区根目录是符号链接，拒绝枚举：${resolvedRoot}`);
+    if (!rootStat.isDirectory()) throw new Error(`[安全拦截] 工作区根路径不是目录，拒绝枚举：${resolvedRoot}`);
+
+    const digest = new Map<string, string>();
+    const walk = async (dir: string, relPrefix: string): Promise<void> => {
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));   // 稳定顺序，便于对账与断言
+        for (const entry of entries) {
+            if (WORKSPACE_DIGEST_IGNORED.has(entry.name)) continue;
+            const full = path.join(dir, entry.name);
+            const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+            if (entry.isSymbolicLink()) throw new Error(`[安全拦截] 工作区包含符号链接，拒绝枚举：${rel}`);
+            if (entry.isDirectory()) {
+                await walk(full, rel);
+                continue;
+            }
+            if (!entry.isFile()) throw new Error(`[安全拦截] 工作区包含非普通文件项，拒绝枚举：${rel}`);
+            const buffer = await fs.readFile(full);
+            digest.set(rel, crypto.createHash('sha256').update(buffer).digest('hex'));
+        }
+    };
+    await walk(resolvedRoot, '');
+    return digest;
+}
+
+/**
+ * 对比两份「相对路径 → SHA256」摘要，输出三类差异：
+ *   + 新增（post 有、base 无）；- 删除（base 有、post 无）；~ 内容变更（两边都有但哈希不同）。
+ * 每条含文件路径与原因；输出按路径稳定排序。
+ */
+export function diffDigest(base: Map<string, string>, post: Map<string, string>): string[] {
+    const entries: { kind: '+' | '-' | '~'; rel: string }[] = [];
+    for (const [rel, digest] of post) {
+        const before = base.get(rel);
+        if (before === undefined) entries.push({ kind: '+', rel });
+        else if (before !== digest) entries.push({ kind: '~', rel });
+    }
+    for (const rel of base.keys()) {
+        if (!post.has(rel)) entries.push({ kind: '-', rel });
+    }
+    const order = { '+': 0, '-': 1, '~': 2 } as const;
+    entries.sort((a, b) => (a.rel === b.rel ? order[a.kind] - order[b.kind] : (a.rel < b.rel ? -1 : 1)));
+    return entries.map(({ kind, rel }) => {
+        if (kind === '+') return `+ 新增：${rel}（测试后出现，基线/快照中不存在）`;
+        if (kind === '-') return `- 删除：${rel}（基线/快照中存在，测试后消失）`;
+        return `~ 内容变更：${rel}（测试后内容与基线/快照不一致）`;
+    });
+}
+
+/** 差异摘要的展示上限：避免超大差异把结果消息撑爆（完整条数仍在 total 中报告）。 */
+function formatDigestDiff(diffs: string[], maxEntries = 20): string {
+    const shown = diffs.slice(0, maxEntries).join('\n');
+    return diffs.length > maxEntries ? `${shown}\n...（其余 ${diffs.length - maxEntries} 条差异已省略）` : shown;
+}
+
 const workspaceLocks = new Map<string, Promise<void>>();
 
 /**
@@ -390,6 +478,7 @@ const SUSPICIOUS_RE = /\b(REJECTED|BYPASS\w*)\b/i;
 const REVIEWER_PROMPT =
     '请进行防御性、安全、边界与需求符合性审查。逐文件审计，特别留意 package.json 的 scripts 字段' +
     '（postinstall/test 等脚本是任意命令执行的持久化载体）与 setup.py/pyproject.toml 的构建钩子。' +
+    '注意：你的审查发生在测试执行之后，不是执行前的安全屏障；发现恶意或可疑脚本仍必须 REJECTED 并写明理由。' +
     '审查完成后，你必须只输出一个 JSON 对象（可置于代码围栏中），' +
     '格式为 {"verdict":"PASS"} 或 {"verdict":"REJECTED","reasons":["问题1","问题2"]}；' +
     '禁止输出任何其他判定性文字。PASS 仅表示你确认代码无安全、越权、边界问题，且完整实现了任务需求。';
@@ -521,12 +610,28 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     const STATE_DIR = options.stateDir ?? path.join(os.tmpdir(), 'dacw-state');
     const RUN_KEY = crypto.randomBytes(32);
     const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir, RUN_KEY);
-    const runner = new Runner(workspaceDir);
+
+    // 测试执行策略只解析一次（探测 docker 守护进程）；blocked 时在写手轮次前快速失败。
+    const sandboxPlan = await resolveExecutionPolicy(options.sandbox);
+    logSystem(context, `🛡️ 测试执行策略：${describePolicy(sandboxPlan)}`);
+    if (sandboxPlan.kind === 'host') {
+        if (options.sandboxExplicit) {
+            logError(context, '[警告] 你显式配置了 sandbox.mode="host"：测试将以宿主用户全权限直接执行（无隔离），'
+                + '写手产出的任意代码——包括 package.json 的 test/pretest 等脚本——都将在你的账号下运行。'
+                + '子代理工具隔离与审查者审计均不构成对测试进程的约束。');
+        } else {
+            logSystem(context, '测试将在宿主直接执行（默认策略，无隔离）；'
+                + '如需容器隔离请设置 config.sandbox.mode: "docker" 或 "auto"（sandbox 分支）。');
+        }
+    }
+    const runner = new Runner(workspaceDir, sandboxPlan);
 
     let baseFiles = new Map<string, string>();
+    /** 对账后的最终交付清单；null 表示本轮尚未完成对账（此时回退到写手基线清单）。 */
+    let finalFiles: string[] | null = null;
     const conversation: ConversationOps = NOOP_CONVERSATION;
     let feedback: string | null = null;
-    const files = () => Array.from(baseFiles.keys());
+    const files = () => finalFiles ?? Array.from(baseFiles.keys());
     const finish = (success: boolean, message: string, round: number) =>
         ({ success, message, status: 'NEED_HUMAN' as const, round, files: files() });
     const abortError = () => {
@@ -538,8 +643,19 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     try {
         await stateManager.init(taskPrompt);
 
+        if (sandboxPlan.kind === 'blocked') {
+            // fail fast：不烧写手轮次——写手无法修复"宿主上没有沙箱"这件事。
+            const message = '沙箱不可用，测试未执行（fail-closed）：' + sandboxPlan.reason + '。'
+                + '你选择了容器模式（sandbox.mode="auto"/"docker"），当前环境无法提供容器，工作流在测试阶段拒绝运行。'
+                + '处理方式：安装/启动 Docker；或改用 sandbox.mode: "host"（宿主直执，无隔离）接受宿主执行。';
+            await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = '沙箱不可用，测试未执行'; });
+            logError(context, message);
+            return finish(false, message, 0);
+        }
+
         for (let round = 1; round <= options.maxRounds; round++) {
             await stateManager.update((s) => { s.round = round; });
+            finalFiles = null;
             conversation.checkpoint();
 
             // 1. 写手阶段
@@ -591,7 +707,34 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 throw new Error(`工作区落盘崩溃，一致性已破坏：${e.message}`);
             }
 
-            // 3. 运行机阶段
+            // 3. 测试前快照（不变量 6 的基准）：测试不得改变工作区任何已有内容。
+            //    baseDigest 来自写手基线（内存），preDigest 是测试前工作区快照（基线 ∪ 地基文件，
+            //    如 package.json）——以快照为期望状态，否则地基文件会被 diff 误判为"新增"。
+            const baseDigest = new Map<string, string>();
+            for (const [rel, content] of baseFiles) {
+                baseDigest.set(rel.split(path.sep).join('/'), crypto.createHash('sha256').update(content, 'utf8').digest('hex'));
+            }
+            let preDigest: Map<string, string>;
+            try {
+                preDigest = await enumerateWorkspace(workspaceDir);
+            } catch (e: any) {
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = `测试前快照失败：${e.message}`; });
+                logError(context, `测试前快照失败（工作区不可完整枚举），强制转人工：${e.message}`);
+                return finish(false, `无法建立测试前快照（工作区不可完整枚举），需人工介入：${e.message}`, round);
+            }
+            const baselineMismatch: string[] = [];
+            for (const [rel, digest] of baseDigest) {
+                if (preDigest.get(rel) !== digest) baselineMismatch.push(rel);
+            }
+            if (baselineMismatch.length > 0) {
+                const detail = baselineMismatch.slice(0, 20).join(', ')
+                    + (baselineMismatch.length > 20 ? ` …（共 ${baselineMismatch.length} 个）` : '');
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = `落盘后基线校验失败：${detail}`; });
+                logError(context, `落盘后基线校验失败（工作区与基线不一致），强制转人工：${detail}`);
+                return finish(false, `写入后的工作区与基线不一致（${baselineMismatch.length} 个文件），需人工介入：${detail}`, round);
+            }
+
+            // 4. 运行机阶段
             logProgress(context, round, options.maxRounds, startTime, '运行机测试中...');
             const sniffed = sniffTestCommand(workspaceDir);
             const testRun = await runner.run(sniffed.command, sniffed.args);
@@ -605,7 +748,28 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             }
             logSuccess(context, '测试通过！');
 
-            // 4. 审查阶段
+            // 5. 测试后对账（不变量 6）：测试可能改写工作区，审查对象必须 === 最终交付物。
+            logProgress(context, round, options.maxRounds, startTime, '测试后对账中...');
+            let postDigest: Map<string, string>;
+            try {
+                postDigest = await enumerateWorkspace(workspaceDir);
+            } catch (e: any) {
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = `测试后对账失败：${e.message}`; });
+                logError(context, `测试后对账失败（最终交付物不可完整枚举），强制转人工：${e.message}`);
+                return finish(false, `测试后无法枚举最终交付物（工作区不可完整枚举），需人工介入：${e.message}`, round);
+            }
+            const digestDiff = diffDigest(preDigest, postDigest);
+            if (digestDiff.length > 0) {
+                const message = `测试后对账不通过：测试执行改变了交付物（${digestDiff.length} 处差异），`
+                    + `已阻止进入审查，需人工介入。\n${formatDigestDiff(digestDiff)}`;
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
+            }
+            finalFiles = Array.from(postDigest.keys());
+            logSuccess(context, `测试后对账通过：${postDigest.size} 个交付文件与基线一致`);
+
+            // 6. 审查阶段
             logProgress(context, round, options.maxRounds, startTime, '审查员代码审计中...');
             let actualCodes = '';
             let readFailed = false;
@@ -638,8 +802,11 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
 
             try {
                 const reviewed = new Set<string>();
-                for (const rel of baseFiles.keys()) {
+                // 审查输入只来自对账后的最终清单（不变量 6）；每个文件都从磁盘读当前内容，不复用内存基线。
+                for (const rel of postDigest.keys()) {
                     const relDisplay = rel.split(path.sep).join('/');
+                    // 锁文件只送 SHA256 摘要（下方单独处理），避免超大文件挤占审查输入
+                    if (LOCK_REVIEW_DIGEST_SET.has(relDisplay)) continue;
                     try {
                         const code = await safeReadForReview(workspaceDir, rel);
                         if (!appendReviewFile(relDisplay, code)) break;
@@ -726,7 +893,12 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });
             logSuccess(context, '全链路通过！进入人工闸门审核。');
             const truncatedNote = reviewTruncated ? `（审查输入超过 ${options.reviewInputMaxChars} 字符上限被截断，请人工确认未送审的大文件）` : '';
-            return finish(true, `代码已通过机器测试与审查，需人工确认合入${truncatedNote}`, round);
+            const sandboxNote = sandboxPlan.kind === 'docker'
+                ? '（测试在一次性容器内执行：无网络、只读根文件系统、非 root、资源受限）'
+                : options.sandboxExplicit
+                    ? '（警告：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
+                    : '（默认策略：测试以宿主用户权限执行，未做隔离）';
+            return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}`, round);
         }
 
         await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });

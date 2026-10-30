@@ -11,8 +11,11 @@
  *      （delivery: 'caller'，不向父会话注入完成通知），返回子代理最终文本。
  *
  * 不变量（与 SAFETY.md 对应）：
- *   - 工具隔离必须真实生效（见上）；preset 不可用或隔离失败时默认 fail-closed 拒绝运行
- *     （allowInheritedPresets 是显式逃生门，打开即接受子代理继承父会话全部工具的风险）；
+ *   - 工具隔离必须真实生效（见上）；preset 不可用或隔离失败时默认 fail-closed 拒绝运行。
+ *     「无法确认隔离」同样是失败：provider 未返回有效 childId（无法确认隔离生效）、或子代理
+ *     上下文缺少 tools.schemas（缺少验证能力）——一律先回收子代理再抛错，绝不记为成功；
+ *     enforceChildToolIsolation=false 是唯一逃生门（用户显式接受风险），allowInheritedPresets
+ *     仅用于允许继承父会话 preset，不改变隔离要求；
  *   - 工作区必须是空目录或带【本插件写入的合法】.dacw-workspace 标记目录，否则拒绝运行，
  *     防止误删用户文件；
  *   - 所有失败都抛错，不静默成功。
@@ -21,8 +24,10 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { apply as createEngine } from './index';
+import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig } from './sandbox';
+import type { SandboxConfig } from './sandbox';
 
-const PLUGIN_VERSION = '1.0.2';
+const PLUGIN_VERSION = '1.1.0';
 const WRITER_PRESET_ID = 'dacw-writer';
 const REVIEWER_PRESET_ID = 'dacw-reviewer';
 const WORKSPACE_MARKER = '.dacw-workspace';
@@ -81,6 +86,8 @@ export interface PluginConfig {
     manifestMaxEntries: number;
     allowInheritedPresets: boolean;
     enforceChildToolIsolation: boolean;
+    /** 测试执行策略：默认 host（宿主直执，无隔离）；容器模式为可选配置（sandbox 分支）。 */
+    sandbox: SandboxConfig;
 }
 
 export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
@@ -100,6 +107,7 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
     manifestMaxEntries: 400,
     allowInheritedPresets: false,
     enforceChildToolIsolation: true,
+    sandbox: DEFAULT_SANDBOX_CONFIG,
 };
 
 function positiveIntOr(value: unknown, fallback: number, warnings: string[], field: string): number {
@@ -150,9 +158,13 @@ function normalizeModelConfig(value: unknown, warnings: string[], field: string)
  * 合并并校验插件配置；非法字段回退默认值并记录警告（不抛错，避免一个错字导致插件无法激活）。
  * 纯函数，供回归自测。
  */
-export function normalizePluginConfig(raw: unknown): { config: PluginConfig; warnings: string[] } {
+export function normalizePluginConfig(raw: unknown): { config: PluginConfig; warnings: string[]; sandboxExplicit: boolean } {
     const warnings: string[] = [];
     const input = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    // 只有用户显式写了 sandbox.mode === 'host' 才算"显式选择宿主执行"；默认值（host）不告警。
+    const rawSandbox = input.sandbox;
+    const sandboxExplicit = !!rawSandbox && typeof rawSandbox === 'object' && !Array.isArray(rawSandbox)
+        && (rawSandbox as Record<string, unknown>).mode === 'host';
     let toolName = nonEmptyStringOr(input.toolName, DEFAULT_PLUGIN_CONFIG.toolName, warnings, 'toolName');
     if (!/^[a-z][a-z0-9_]*$/.test(toolName)) {
         warnings.push(`config.toolName 非法（需匹配 /^[a-z][a-z0-9_]*$/），已回退默认值 ${DEFAULT_PLUGIN_CONFIG.toolName}`);
@@ -178,6 +190,7 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
         manifestMaxEntries: positiveIntOr(input.manifestMaxEntries, DEFAULT_PLUGIN_CONFIG.manifestMaxEntries, warnings, 'manifestMaxEntries'),
         allowInheritedPresets: input.allowInheritedPresets === true,
         enforceChildToolIsolation: input.enforceChildToolIsolation !== false,
+        sandbox: normalizeSandboxConfig(input.sandbox, warnings, 'config.sandbox'),
     };
     if (config.chatTimeoutMaxMs < config.chatTimeoutBaseMs) {
         warnings.push('config.chatTimeoutMaxMs 小于 chatTimeoutBaseMs，已把 chatTimeoutMaxMs 提升到 base');
@@ -189,7 +202,11 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
     if (!config.enforceChildToolIsolation) {
         warnings.push('config.enforceChildToolIsolation=false：不再强制剥离子代理的宿主全局工具');
     }
-    return { config, warnings };
+    if (sandboxExplicit) {
+        warnings.push('config.sandbox.mode="host"：测试将以宿主用户全权限直接执行写手产出的代码（无任何隔离）。'
+            + '仅在你显式信任写手输出与工作区内容时使用。');
+    }
+    return { config, warnings, sandboxExplicit };
 }
 
 /** 从子代理 `SubagentResult.output`（ContentBlock[]）提取最终文本；非 text block 忽略。 */
@@ -539,30 +556,41 @@ interface IsolationState {
 /**
  * 把宿主全局工具从 DACW 子代理作用域中全部剥除，并在隔离后校验子代理作用域确实看不到工具。
  * 失败时【抛错】：agent/created 是 serial 监听器，抛错会让本次子代理创建失败（不发布），
- * 避免"已发布但还带着继承工具"的时间窗。返回 void（成功）或 throw。
+ * 避免"已发布但还带着继承工具"的时间窗。
+ *
+ * fail-closed（E 组）：只有「restrict 成功应用」+「tools.schemas(agent) 返回空数组」两个条件
+ * 同时满足才记为成功；验证能力缺失（缺 tools.schemas / 返回非数组 / 调用抛错）一律 fail，
+ * 绝不"无法验证但记成功"。enforceChildToolIsolation=false 是唯一逃生门（见 apply()）。
  */
-function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, logger: ReturnType<typeof makeLogger>): void {
+export function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, logger: ReturnType<typeof makeLogger>): void {
     const fail = (reason: string): never => {
         isolation.failures += 1;
         isolation.lastError = reason;
         logger.error(`DACW: 子代理工具隔离失败：${reason}`);
         throw new Error(`[DACW] 子代理工具隔离失败：${reason}`);
     };
+    /** 隔离机制已应用、但验证能力缺失：先打诚实的"无法验证"日志，再 fail（不得记为成功）。 */
+    const failUnverified = (reason: string): never => {
+        logger.error(`DACW: 子代理 ${String(agent && agent.id)} 隔离已应用但无法验证（${reason}）`);
+        return fail(reason);
+    };
     if (!agent || !agent.ctx || !agent.ctx.tools || typeof agent.ctx.tools.restrict !== 'function') {
         fail('子代理上下文缺少 tools.restrict');
     }
     const childId = String(agent.id);
     let dispose: unknown = null;
+    let restrictApplied = false;
     let strategy = '';
     try {
         // 首选 allow: []：完全遮蔽全部工具（含之后才注册的全局工具）。
         dispose = agent.ctx.tools.restrict({ allow: [] });
+        restrictApplied = true;
         strategy = 'allow:[]';
     } catch {
-        // 宿主不接受空 allow 时回退为 deny 快照；拿不到快照就 fail-closed。
+        // 只有 allow:[] 失败时才走 deny 快照回退；回退必须能枚举全局工具，否则无法安全回退。
+        if (typeof ctx.tools.schemas !== 'function') fail('无法枚举宿主全局工具（ctx.tools.schemas 缺失），无法安全回退');
         let names: string[] = [];
         try {
-            if (typeof ctx.tools.schemas !== 'function') fail('无法枚举宿主全局工具（ctx.tools.schemas 缺失），无法安全回退');
             names = ctx.tools.schemas()
                 .map((schema: any) => schema && schema.name)
                 .filter((name: unknown) => typeof name === 'string' && name);
@@ -570,30 +598,34 @@ function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, log
             fail(`读取宿主全局工具列表失败：${errorMessage(error)}`);
         }
         if (names.length === 0) {
-            // 没有可 deny 的全局工具：空 deny 会被拒绝，只能依赖下面的"可见工具为空"校验。
-            dispose = null;
-            strategy = 'no-global-tools';
-        } else {
-            try {
-                dispose = agent.ctx.tools.restrict({ deny: names });
-                strategy = `deny:${names.join(',')}`;
-            } catch (error) {
-                fail(`ctx.tools.restrict 执行失败：${errorMessage(error)}`);
-            }
+            // 空 deny 会被宿主拒绝：没有可应用的隔离机制 => 不可记为成功（fail-closed）。
+            fail('宿主全局工具列表为空且 allow:[] 不可用，无法应用工具隔离');
+        }
+        try {
+            dispose = agent.ctx.tools.restrict({ deny: names });
+            restrictApplied = true;
+            strategy = `deny:${names.join(',')}`;
+        } catch (error) {
+            fail(`ctx.tools.restrict 执行失败：${errorMessage(error)}`);
         }
     }
-    // 生效校验：隔离后子代理作用域可见的工具必须为空。
+    // 生效校验：必须同时满足「restrict 成功应用」+「schemas(agent) 返回空数组」才记为成功。
+    if (!restrictApplied) failUnverified('restrict 未成功应用');
+    if (typeof agent.ctx.tools.schemas !== 'function') {
+        failUnverified('子代理上下文缺少 tools.schemas，无法验证隔离生效');
+    }
+    let visible: unknown;
     try {
-        if (typeof agent.ctx.tools.schemas === 'function') {
-            const visible = agent.ctx.tools.schemas(agent);
-            if (Array.isArray(visible) && visible.length > 0) {
-                const names = visible.map((schema: any) => schema && schema.name).filter(Boolean).join(', ');
-                fail(`隔离后子代理仍可见 ${visible.length} 个工具（${names}）`);
-            }
-        }
+        visible = agent.ctx.tools.schemas(agent);
     } catch (error) {
-        if (error instanceof Error && error.message.startsWith('[DACW]')) throw error;
-        fail(`隔离生效校验失败：${errorMessage(error)}`);
+        failUnverified(`调用 tools.schemas(agent) 失败：${errorMessage(error)}`);
+    }
+    if (!Array.isArray(visible)) {
+        failUnverified('tools.schemas(agent) 未返回工具数组，无法验证隔离生效');
+    }
+    if (visible.length > 0) {
+        const names = visible.map((schema: any) => schema && schema.name).filter(Boolean).join(', ');
+        fail(`隔离后子代理仍可见 ${visible.length} 个工具（${names}）`);
     }
     if (typeof dispose === 'function') isolation.disposers.set(childId, dispose as () => void);
     isolation.restricted.add(childId);
@@ -602,10 +634,10 @@ function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, log
 }
 
 /** 子代理最终文本 → 协调器需要的字符串；失败时抛出结构化错误（协调器会打回/终止）。 */
-async function runSubagentChat(options: {
+export async function runSubagentChat(options: {
     subagents: any;
     config: PluginConfig;
-    presets: { ready: boolean };
+    presets: { ready: boolean; reason?: string };
     isolation: IsolationState;
     agent: unknown;
     workspaceDir: string;
@@ -632,13 +664,35 @@ async function runSubagentChat(options: {
         throw new Error(`[DACW] ${role} 子代理启动失败：${errorMessage(error)}`);
     }
     const childId = activation && activation.childId ? String(activation.childId) : '';
+    const disposeActivation = async () => {
+        try { if (activation && typeof activation.dispose === 'function') await activation.dispose(); } catch { /* 尽力清理 */ }
+    };
 
     // fail-closed：要求隔离生效的子代理，在启动后必须确认工具已被剥离。
-    if (config.enforceChildToolIsolation && presets.ready && childId && !isolation.restricted.has(childId)) {
-        try { if (activation && typeof activation.dispose === 'function') await activation.dispose(); } catch { /* 尽力清理 */ }
-        throw new Error(
-            `[DACW] 子代理 ${childId} 的工具隔离未生效（${isolation.lastError || '未知原因'}）：` +
-            `拒绝在写手/审查者可能继承宿主工具的情况下运行。可修复宿主环境，或在明确接受风险后设置 config.allowInheritedPresets / enforceChildToolIsolation=false。`);
+    // E 组验收：enforce=true 时任何「无法确认隔离」的路径都必须终止——
+    //   preset 不可用（无法确认运行在零工具 preset 上）、provider 未返回 childId、隔离未生效。
+    // 唯一逃生门是显式 enforceChildToolIsolation=false（allowInheritedPresets 不再单独构成旁路）。
+    if (config.enforceChildToolIsolation) {
+        if (!presets.ready) {
+            await disposeActivation();
+            throw new Error(
+                `[DACW] enforceChildToolIsolation=true 但写手/审查者专用 preset 不可用（${presets.reason || '未知原因'}），`
+                + '无法确认子代理运行在零工具 preset 上：拒绝运行。'
+                + '请修复 preset 注册，或在明确接受风险后设置 config.enforceChildToolIsolation=false。');
+        }
+        if (!childId) {
+            await disposeActivation();
+            throw new Error(
+                '[DACW] provider 未返回有效 childId，无法确认隔离生效：'
+                + '拒绝在写手/审查者可能继承宿主工具的情况下运行。'
+                + '可修复宿主环境，或在明确接受风险后设置 config.enforceChildToolIsolation=false。');
+        }
+        if (!isolation.restricted.has(childId)) {
+            await disposeActivation();
+            throw new Error(
+                `[DACW] 子代理 ${childId} 的工具隔离未生效（${isolation.lastError || '未知原因'}）：` +
+                `拒绝在写手/审查者可能继承宿主工具的情况下运行。可修复宿主环境，或在明确接受风险后设置 config.enforceChildToolIsolation=false。`);
+        }
     }
     if (childId) dacwChildren.add(childId);
 
@@ -808,6 +862,8 @@ function renderToolResultText(value: any): string {
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
     '独立审查者子代理审计全量文件并给出 JSON 裁决 → 通过后停在人工闸门（NEED_HUMAN），绝不自动合入。' +
+    '测试在任何审查之前执行；默认在宿主直接执行（无隔离）：测试以宿主用户权限运行写手产出代码；' +
+    '设置 sandbox.mode:"docker" 或 "auto" 可启用一次性容器（sandbox 分支）。审查者审计是侦探性控制，不是执行前屏障。' +
     '当需要"让模型写代码、让真实测试验证、让独立审查者把关、最后人工确认"时使用本工具。' +
     '注意：DACW 每轮都会把工作区内容重置为产出文件集（仅保留 package.json 等地基文件与 .git/node_modules），' +
     '因此必须指向专用空目录（工具会写入 .dacw-workspace 标记）；不要在存放重要文件的目录上运行。' +
@@ -816,7 +872,7 @@ const TOOL_DESCRIPTION =
     '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。';
 
 export function apply(ctx: any, rawConfig?: unknown) {
-    const { config, warnings } = normalizePluginConfig(rawConfig);
+    const { config, warnings, sandboxExplicit } = normalizePluginConfig(rawConfig);
     const logger = makeLogger(ctx);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
 
@@ -992,7 +1048,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 throw new Error(
                     `[DACW] 子代理 provider "${providerName}" 不支持 agentPreset（独立 preset 子代理），` +
                     `无法保证写手/审查者运行在专用零工具 preset 上；请改用 spawn（@deepseek-ai/dsh-subagent-spawn-in-process），` +
-                    `或在明确接受风险后设置 config.allowInheritedPresets: true。`);
+                    `或在明确接受风险后同时设置 config.allowInheritedPresets: true 与 config.enforceChildToolIsolation: false。`);
             }
             const agent = exec && exec.agent ? exec.agent : null;
             if (!agent) throw new Error('[DACW] 只能由 Agent 调用：执行上下文缺少调用方 Agent');
@@ -1001,7 +1057,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 throw new Error(
                     `[DACW] 写手/审查者专用 preset 不可用（${presets.reason}），拒绝让子代理继承父会话工具运行。` +
                     `请修复 preset 注册（需要 @deepseek-ai/dsh-persona 与 agentPresets 服务），` +
-                    `或在明确接受风险后设置 config.allowInheritedPresets: true。`);
+                    `或在明确接受风险后设置 config.allowInheritedPresets: true 与 config.enforceChildToolIsolation: false。`);
             }
 
             // 解析写手/审查者实际模型：读取 DSH 已配置模型目录 / 默认模型；配置错误在启动工作流前 fail-closed。
@@ -1043,6 +1099,8 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 manifestMaxEntries: config.manifestMaxEntries,
                 stateDir: config.stateDir || null,
                 roleModels: roleModelLabels,
+                sandbox: config.sandbox,
+                sandboxExplicit,
             });
             const rawTaskId = taskIdArg || `dacw-${Date.now().toString(36)}`;
             const result = await executeTask(rawTaskId, workspaceDir, task);
@@ -1070,6 +1128,6 @@ export function apply(ctx: any, rawConfig?: unknown) {
 
     ctx.effect(() => ctx.tools.register(toolDefinition));
     logger.info(
-        `DACW: 工具 ${config.toolName} 已注册（workspacePolicy=${config.workspacePolicy}, provider=${config.subagentProvider}, ` +
-        `enforceChildToolIsolation=${config.enforceChildToolIsolation}）`);
+        `DACW: 工具 ${config.toolName} 已注册（workspacePolicy=${config.workspacePolicy}, sandbox=${config.sandbox.mode}, ` +
+        `provider=${config.subagentProvider}, enforceChildToolIsolation=${config.enforceChildToolIsolation}）`);
 }

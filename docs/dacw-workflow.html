@@ -5398,8 +5398,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <h3>执行位置与工作区</h3>
         </div>
         <ul>
-          <li>测试在宿主直接执行：写手产出的代码以宿主用户权限运行，无隔离</li>
-          <li>不提供容器级隔离：命令白名单、环境变量白名单与超时强杀只降低风险</li>
+          <li>默认 sandbox.mode=host：测试以宿主权限执行，无隔离</li>
+          <li>docker / auto 可选一次性容器：无网络、只读根文件系统、非 root</li>
           <li>每轮把工作区重置为合并后的文件集，未提及文件逐字节保留</li>
         </ul>
       </div>

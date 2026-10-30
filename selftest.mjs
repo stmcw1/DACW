@@ -4,18 +4,29 @@
 // 原理：直接加载构建产物 dist/（插件运行时真正加载的代码），对导出的纯函数跑回归向量。
 //      不执行工作流、不写文件系统、不调用任何模型。
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 const engine = await import('./dist/index.js');
 const plugin = await import('./dist/plugin.js');
+const sandbox = await import('./dist/sandbox.js');
+const runnerModule = await import('./dist/runner.js');
 
-const { parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS } = engine;
+const {
+    parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
+    enumerateWorkspace, diffDigest,
+} = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
     parseModelSpec, matchModelInCatalogue, formatModelLabel, formatInheritLabel, DEFAULT_PLUGIN_CONFIG,
+    restrictChildTools, runSubagentChat,
 } = plugin;
+const {
+    normalizeSandboxConfig, buildDockerRunArgv, defaultImageForCommand, describePolicy, DEFAULT_SANDBOX_CONFIG,
+} = sandbox;
+const { Runner } = runnerModule;
 
 let pass = 0;
 let fail = 0;
@@ -107,6 +118,20 @@ t('合并后文件集为空必须抛错', () => throws(() => {
     mergeDelta(new Map([['a.py', 'v1']]), parseWriterDelta('{"changed":[],"deleted":["a.py"]}'), WS);
 }));
 
+// ================= 测试后对账：差异摘要（安全不变量 6） =================
+t('diffDigest：+ / - / ~ 三类差异，路径稳定排序且带原因', () => {
+    const base = new Map([['a.js', 'h1'], ['b.js', 'h2'], ['gone.js', 'h3']]);
+    const post = new Map([['a.js', 'h1'], ['b.js', 'CHANGED'], ['new.js', 'h4']]);
+    eq(diffDigest(base, post), [
+        '~ 内容变更：b.js（测试后内容与基线/快照不一致）',
+        '- 删除：gone.js（基线/快照中存在，测试后消失）',
+        '+ 新增：new.js（测试后出现，基线/快照中不存在）',
+    ]);
+});
+t('diffDigest：无差异返回空数组', () => {
+    eq(diffDigest(new Map([['a.js', 'h1']]), new Map([['a.js', 'h1']])), []);
+});
+
 // ================= parseReviewVerdict：裁决回归 =================
 t('verdict PASS', () => eq(parseReviewVerdict('{"verdict":"PASS"}'), { verdict: 'PASS', reasons: [] }));
 t('verdict REJECTED', () => eq(
@@ -166,6 +191,81 @@ t('插件配置：工具隔离默认开启，仅显式 false 关闭', () => {
     assert.equal(normalizePluginConfig({}).config.enforceChildToolIsolation, true);
     assert.equal(normalizePluginConfig({ enforceChildToolIsolation: false }).config.enforceChildToolIsolation, false);
     assert.equal(normalizePluginConfig({ enforceChildToolIsolation: 0 }).config.enforceChildToolIsolation, true);
+});
+
+// ================= 沙箱策略：测试执行位置（安全边界核心） =================
+t('沙箱配置：缺省用默认值（host）', () => {
+    eq(normalizeSandboxConfig(null, [], 'x'), DEFAULT_SANDBOX_CONFIG);
+    assert.equal(DEFAULT_SANDBOX_CONFIG.mode, 'host');
+});
+t('沙箱配置：非法 mode / 数值回退并逐项告警', () => {
+    const warnings = [];
+    const config = normalizeSandboxConfig(
+        { mode: 'vm', memoryMb: -1, cpus: 0, pidsLimit: 'x', tmpfsMb: 0 }, warnings, 'config.sandbox');
+    eq(config, DEFAULT_SANDBOX_CONFIG);
+    assert.equal(warnings.length, 5);
+    assert.match(warnings[0], /config\.sandbox\.mode/);
+    assert.match(warnings[1], /memoryMb/);
+});
+t('沙箱配置：合法覆盖生效（cpus 允许小数、image 去空白）', () => {
+    eq(normalizeSandboxConfig(
+        { mode: 'host', image: ' node:22 ', memoryMb: 512, cpus: 1.5, pidsLimit: 64, tmpfsMb: 32 }, [], 'x'),
+        { mode: 'host', image: 'node:22', memoryMb: 512, cpus: 1.5, pidsLimit: 64, tmpfsMb: 32 });
+});
+t('默认镜像：按测试命令族选择', () => {
+    eq(defaultImageForCommand('npm'), 'node:22-bookworm-slim');
+    eq(defaultImageForCommand('node'), 'node:22-bookworm-slim');
+    eq(defaultImageForCommand('pytest'), 'python:3.12-slim');
+    eq(defaultImageForCommand('python3'), 'python:3.12-slim');
+    eq(defaultImageForCommand('cargo'), 'rust:1-slim');
+    eq(defaultImageForCommand('go'), 'golang:1.23-bookworm');
+});
+t('docker 参数：隔离与资源限制开关齐全，工作区以一次性暂存目录挂载', () => {
+    const argv = buildDockerRunArgv(
+        { image: 'node:22-bookworm-slim', memoryMb: 512, cpus: 1.5, pidsLimit: 64, tmpfsMb: 32 },
+        '/tmp/dacw-sandbox-xyz', 'dacw-testname', 'npm', ['run', 'test']);
+    for (const [flag, value] of [
+        ['--network', 'none'], ['--cap-drop', 'ALL'], ['--security-opt', 'no-new-privileges'],
+        ['--user', '1000:1000'], ['--pids-limit', '64'], ['--cpus', '1.5'],
+        ['--memory', '512m'], ['--memory-swap', '512m'], ['--tmpfs', '/tmp:rw,nosuid,size=32m'],
+        ['--name', 'dacw-testname'], ['--workdir', '/dacw'],
+    ]) {
+        const i = argv.indexOf(flag);
+        assert.ok(i >= 0, `缺少 ${flag}`);
+        assert.equal(argv[i + 1], value, `${flag} 的值不对：${argv[i + 1]}`);
+    }
+    assert.ok(argv.includes('--read-only'), '缺少 --read-only');
+    assert.ok(argv.includes('--rm'), '缺少 --rm');
+    assert.ok(argv.includes('/tmp/dacw-sandbox-xyz:/dacw'), '暂存目录挂载缺失');
+    assert.deepEqual(argv.slice(argv.indexOf('node:22-bookworm-slim') + 1), ['npm', 'run', 'test'], '容器内命令/参数透传不对');
+});
+t('策略描述：三种策略均给出诚实标注', () => {
+    assert.match(describePolicy({ kind: 'blocked', reason: 'no docker' }), /拒绝执行/);
+    assert.match(describePolicy({ kind: 'host' }), /无隔离/);
+    assert.match(describePolicy({ kind: 'docker', image: 'x', memoryMb: 1, cpus: 1, pidsLimit: 1, tmpfsMb: 1 }), /无网络/);
+});
+t('引擎配置：sandbox 默认注入且可局部覆盖', () => {
+    eq(resolveEngineOptions(null).sandbox, DEFAULT_SANDBOX_CONFIG);
+    const resolved = resolveEngineOptions({ sandbox: { mode: 'host' } });
+    assert.equal(resolved.sandbox.mode, 'host');
+    assert.equal(resolved.sandbox.memoryMb, DEFAULT_SANDBOX_CONFIG.memoryMb);
+});
+t('引擎配置：sandboxExplicit 默认 false，仅显式 true 生效', () => {
+    assert.equal(resolveEngineOptions(null).sandboxExplicit, false);
+    assert.equal(resolveEngineOptions({ sandboxExplicit: true }).sandboxExplicit, true);
+    assert.equal(resolveEngineOptions({ sandboxExplicit: 'yes' }).sandboxExplicit, false);
+});
+t('插件配置：sandbox 默认 host 不告警；显式 host 才告警并标记 explicit', () => {
+    // workspacePolicy 显式给出，避免触发既有的"缺省 workspacePolicy"告警，隔离本用例的断言面
+    const defaults = normalizePluginConfig({ workspacePolicy: 'guarded' });
+    assert.equal(defaults.config.sandbox.mode, 'host');
+    assert.equal(defaults.sandboxExplicit, false);
+    assert.equal(defaults.warnings.length, 0, JSON.stringify(defaults.warnings));  // 默认值不告警
+    const explicit = normalizePluginConfig({ sandbox: { mode: 'host' } });
+    assert.equal(explicit.sandboxExplicit, true);
+    assert.ok(explicit.warnings.some((w) => w.includes('宿主用户全权限')), JSON.stringify(explicit.warnings));
+    // 显式选了容器模式，不算"显式宿主直执"
+    assert.equal(normalizePluginConfig({ sandbox: { mode: 'auto' } }).sandboxExplicit, false);
 });
 
 // ================= isValidWorkspaceMarker：工作区标记必须校验内容 =================
@@ -360,6 +460,220 @@ try {
     await ta('工作区闸门：拒绝用户主目录', async () => rejects(() => prepareWorkspace(tmpRoot, os.homedir(), 'guarded')));
     await ta('工作区闸门：拒绝文件系统根', async () => rejects(() => prepareWorkspace(tmpRoot, path.parse(tmpRoot).root, 'guarded')));
 
+    await ta('enumerateWorkspace：忽略三件套、路径统一 / 分隔、SHA256 正确、符号链接拒绝', async () => {
+        const dir = path.join(tmpRoot, 'enum-ws');
+        await fs.mkdir(path.join(dir, 'sub'), { recursive: true });
+        await fs.mkdir(path.join(dir, 'node_modules', 'dep'), { recursive: true });
+        await fs.mkdir(path.join(dir, '.git'), { recursive: true });
+        await fs.writeFile(path.join(dir, 'sub', 'a.txt'), 'hello');
+        await fs.writeFile(path.join(dir, 'node_modules', 'dep', 'index.js'), 'dep');
+        await fs.writeFile(path.join(dir, '.git', 'HEAD'), 'ref');
+        await fs.writeFile(path.join(dir, '.dacw-workspace'), '{}');
+        await fs.writeFile(path.join(dir, 'root.txt'), 'r');
+        const digest = await enumerateWorkspace(dir);
+        eq(Array.from(digest.keys()), ['root.txt', 'sub/a.txt']);
+        assert.equal(digest.get('sub/a.txt'), crypto.createHash('sha256').update('hello').digest('hex'));
+        // 符号链接必须拒绝；Windows 非管理员可能无法创建链接（EPERM），此时跳过该断言
+        let linked = false;
+        try {
+            await fs.symlink(path.join(dir, 'root.txt'), path.join(dir, 'link.txt'));
+            linked = true;
+        } catch { /* 无权限创建符号链接：跳过 */ }
+        if (linked) await rejects(() => enumerateWorkspace(dir));
+    });
+
+    // ---- 隔离 fail-closed（E 组）：无法确认隔离即终止，绝不记为成功 ----
+    const makeIsolation = () => ({ enabled: true, restricted: new Set(), disposers: new Map(), applied: 0, failures: 0, lastError: '' });
+    const quietLogger = () => ({ info() { }, warn() { }, error() { } });
+
+    await ta('隔离：provider 未返回 childId → dispose 后抛错，不继续运行', async () => {
+        let disposed = false;
+        const subagents = {
+            startActivation: async () => ({
+                childId: '',
+                dispose: async () => { disposed = true; },
+                result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'should-not-run' }] }),
+            }),
+        };
+        await assert.rejects(
+            () => runSubagentChat({
+                subagents,
+                config: DEFAULT_PLUGIN_CONFIG,
+                presets: { ready: true },
+                isolation: makeIsolation(),
+                agent: { id: 'parent' },
+                workspaceDir: tmpRoot,
+                signal: undefined,
+                role: 'writer',
+                text: 'x',
+                dacwChildren: new Set(),
+                logger: quietLogger(),
+                roleModel: { agentOptions: null, label: 'inherit', source: 'inherit' },
+            }),
+            /未返回有效 childId/);
+        assert.equal(disposed, true);
+    });
+    await ta('隔离：enforce=true 但 preset 不可用 → dispose 后抛错（allowInheritedPresets 不构成旁路）', async () => {
+        let disposed = false;
+        const subagents = {
+            startActivation: async () => ({
+                childId: 'child-inherited',
+                dispose: async () => { disposed = true; },
+                result: Promise.resolve({ stopReason: 'completed', output: [] }),
+            }),
+        };
+        await assert.rejects(
+            () => runSubagentChat({
+                subagents,
+                config: { ...DEFAULT_PLUGIN_CONFIG, allowInheritedPresets: true },
+                presets: { ready: false, reason: '测试用：preset 注册失败' },
+                isolation: makeIsolation(),
+                agent: { id: 'parent' },
+                workspaceDir: tmpRoot,
+                signal: undefined,
+                role: 'writer',
+                text: 'x',
+                dacwChildren: new Set(),
+                logger: quietLogger(),
+                roleModel: { agentOptions: null, label: 'inherit', source: 'inherit' },
+            }),
+            /preset 不可用/);
+        assert.equal(disposed, true);
+    });
+    await ta('隔离：缺少 tools.schemas → 抛错、不计 applied、打"无法验证"日志', async () => {
+        const ctx = { tools: { schemas: () => [{ name: 'dacw_run' }] } };
+        const agent = { id: 'child-noschema', ctx: { tools: { restrict: () => () => { } } } };
+        const isolation = makeIsolation();
+        const errors = [];
+        const logger = { info() { }, warn() { }, error: (message) => errors.push(message) };
+        assert.throws(() => restrictChildTools(ctx, agent, isolation, logger), /tools\.schemas/);
+        assert.equal(isolation.applied, 0);
+        assert.equal(isolation.failures, 1);
+        assert.equal(isolation.restricted.has('child-noschema'), false);
+        assert.ok(errors.some((line) => line.includes('隔离已应用但无法验证')), JSON.stringify(errors));
+    });
+    await ta('隔离：allow:[] 不可用且宿主缺少 ctx.tools.schemas → 拒绝回退、抛错', async () => {
+        const ctx = { tools: {} };
+        const agent = { id: 'child-fallback', ctx: { tools: { restrict: () => { throw new Error('allow:[] unsupported'); } } } };
+        const isolation = makeIsolation();
+        assert.throws(() => restrictChildTools(ctx, agent, isolation, quietLogger()), /无法安全回退/);
+        assert.equal(isolation.applied, 0);
+        assert.equal(isolation.failures, 1);
+    });
+    await ta('隔离：restrict 成功且 schemas 返回空数组才记成功（applied=1，日志 0 个）', async () => {
+        const ctx = { tools: { schemas: () => [{ name: 'dacw_run' }] } };
+        const agent = { id: 'child-ok', ctx: { tools: { restrict: () => () => { }, schemas: () => [] } } };
+        const isolation = makeIsolation();
+        const infos = [];
+        const logger = { info: (message) => infos.push(message), warn() { }, error() { } };
+        restrictChildTools(ctx, agent, isolation, logger);
+        assert.equal(isolation.applied, 1);
+        assert.equal(isolation.failures, 0);
+        assert.equal(isolation.restricted.has('child-ok'), true);
+        assert.equal(isolation.disposers.size, 1);
+        assert.ok(infos.some((line) => line.includes('隔离后可见工具 0 个')), JSON.stringify(infos));
+    });
+
+    await ta('运行机：blocked 策略拒绝执行测试（fail-closed，不启动任何进程）', async () => {
+        const runner = new Runner(tmpRoot, { kind: 'blocked', reason: '测试用：Docker 不可用' });
+        const result = await runner.run('npm', ['run', 'test'], 1000);
+        assert.equal(result.success, false);
+        assert.equal(result.timedOut, false);
+        assert.match(result.output, /测试未执行/);
+        assert.match(result.output, /运行机拒绝执行测试/);
+    });
+    await ta('运行机：非白名单命令一律拒绝（甚至不进入策略分支）', async () => {
+        const runner = new Runner(tmpRoot, { kind: 'blocked', reason: '测试用' });
+        const result = await runner.run('powershell', ['-Command', 'whoami'], 1000);
+        assert.equal(result.success, false);
+        assert.match(result.output, /未授权命令/);
+    });
+    await ta('运行机：host 策略可执行 node 并回传输出（显式 host 才走宿主）', async () => {
+        const prevPath = process.env.PATH;
+        process.env.PATH = path.dirname(process.execPath) + path.delimiter + (prevPath ?? '');
+        try {
+            const runner = new Runner(tmpRoot, { kind: 'host' });
+            const result = await runner.run('node', ['-e', 'process.stdout.write("hello-host")'], 15000);
+            assert.equal(result.success, true, result.output);
+            assert.match(result.output, /hello-host/);
+        } finally {
+            process.env.PATH = prevPath;
+        }
+    });
+
+    // ---- 测试后对账（不变量 6）：假 npm 模拟「测试期改写工作区」 ----
+    const makeFakeNpm = async (name, scriptBody) => {
+        const binDir = path.join(tmpRoot, name, 'bin');
+        await fs.mkdir(path.join(binDir, 'node_modules', 'npm', 'bin'), { recursive: true });
+        await fs.writeFile(path.join(binDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'), scriptBody, 'utf8');
+        if (process.platform === 'win32') {
+            await fs.writeFile(path.join(binDir, 'npm.cmd'), '@echo off\r\n', 'utf8');
+        } else {
+            await fs.writeFile(path.join(binDir, 'npm'), '#!/usr/bin/env node\n' + scriptBody, 'utf8');
+            await fs.chmod(path.join(binDir, 'npm'), 0o755);
+        }
+        return binDir;
+    };
+
+    const runReconWorkflow = async (tag, scriptBody) => {
+        const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
+        const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
+        await fs.mkdir(wsDir, { recursive: true });
+        await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }), 'utf8');
+        const prevPath = process.env.PATH;
+        process.env.PATH = binDir + path.delimiter + path.dirname(process.execPath) + path.delimiter + (prevPath ?? '');
+        try {
+            let reviewerCalled = false;
+            let reviewerInput = '';
+            const context = {
+                chat: async (agentId, _prompt, contextText) => {
+                    if (agentId === 'reviewer-agent') {
+                        reviewerCalled = true;
+                        reviewerInput = contextText;
+                        return '{"verdict":"PASS"}';
+                    }
+                    return JSON.stringify({ changed: [{ file: 'main.js', code: 'console.log(1);\n' }], deleted: [] });
+                },
+                log: () => { },
+            };
+            const execute = engine.apply(context, { maxRounds: 1, stateDir: path.join(tmpRoot, `state-recon-${tag}`) });
+            const result = await execute(`selftest-recon-${tag}`, wsDir, 'task');
+            return { result, reviewerCalled, reviewerInput };
+        } finally {
+            process.env.PATH = prevPath;
+        }
+    };
+
+    await ta('对账：测试脚本新建 unreviewed.js → success:false、转人工、不进入审查', async () => {
+        const script = "const fs = require('node:fs');\nfs.writeFileSync('unreviewed.js', 'console.log(\"injected\");\\n');\n";
+        const { result, reviewerCalled } = await runReconWorkflow('add', script);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /unreviewed\.js/);
+        assert.match(result.message, /\+ 新增/);
+        assert.equal(reviewerCalled, false);
+    });
+    await ta('对账：测试脚本改写已生成文件 → success:false、转人工、message 含 ~ 标记', async () => {
+        const script = "const fs = require('node:fs');\nfs.appendFileSync('main.js', '\\n// tampered by test\\n');\n";
+        const { result, reviewerCalled } = await runReconWorkflow('modify', script);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /main\.js/);
+        assert.match(result.message, /~ 内容变更/);
+        assert.equal(reviewerCalled, false);
+    });
+    await ta('对账：测试未改动工作区 → 进入审查；files 与审查输入均来自最终清单', async () => {
+        const { result, reviewerCalled, reviewerInput } = await runReconWorkflow('clean', 'process.exit(0);');
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.ok(Array.isArray(result.files));
+        assert.ok(result.files.includes('main.js'), JSON.stringify(result.files));
+        assert.ok(result.files.includes('package.json'), JSON.stringify(result.files));
+        assert.match(reviewerInput, /--- 文件: main\.js ---/);
+        assert.match(reviewerInput, /--- 文件: package\.json ---/);
+    });
+
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
         const logs = [];
         const context = { chat: async () => '不是 JSON', log: (message) => logs.push(message) };
@@ -376,6 +690,25 @@ try {
                 && line.includes('继承父会话路由')),
             `日志里没有模型配置行：${JSON.stringify(logs)}`,
         );
+    });
+    await ta('引擎审计日志：默认 host 只有普通提示；显式 host 出现红色警告', async () => {
+        const runEngine = async (options, tag) => {
+            const logs = [];
+            const context = { chat: async () => '不是 JSON', log: (message) => logs.push(message) };
+            const execute = engine.apply(context, { maxRounds: 1, stateDir: path.join(tmpRoot, `state-grading-${tag}`), ...options });
+            await execute(`selftest-grading-${tag}`, path.join(tmpRoot, `ws-grading-${tag}`), 'task');
+            return logs;
+        };
+        const defaultLogs = await runEngine({}, 'default');
+        assert.ok(defaultLogs.some((line) => line.includes('测试执行策略')), JSON.stringify(defaultLogs));
+        assert.ok(defaultLogs.some((line) => line.includes('默认策略，无隔离')), `缺默认策略提示：${JSON.stringify(defaultLogs)}`);
+        assert.equal(
+            defaultLogs.some((line) => line.includes('你显式配置了 sandbox.mode="host"')),
+            false, '默认值不应出现红色 host 警告');
+        const explicitLogs = await runEngine({ sandbox: { mode: 'host' }, sandboxExplicit: true }, 'explicit');
+        assert.ok(
+            explicitLogs.some((line) => line.includes('你显式配置了 sandbox.mode="host"')),
+            `缺显式 host 警告：${JSON.stringify(explicitLogs)}`);
     });
 } finally {
     await fs.rm(tmpRoot, { recursive: true, force: true });
