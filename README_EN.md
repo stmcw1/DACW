@@ -37,6 +37,8 @@ Writer (JSON changeset) → Orchestrator (validate / merge / write) → Runner (
 
 ## Install
 
+> **Prerequisite (DSH host environment)**: the host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). They are used to create the writer/reviewer zero-tool presets and to enforce child tool isolation; **on an older host DACW fails closed and refuses to run** (it never silently degrades to inheriting the parent session's tools), preserving the isolation safety floor.
+
 Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` provider (`@deepseek-ai/dsh-subagent-spawn-in-process`); Node ≥ 22.13 for the build; the tested project's dependencies must be installed manually.
 
 ```bash

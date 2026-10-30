@@ -43,6 +43,8 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ## 安装
 
+> **前置要求（DSH 宿主环境）**：宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。它们用于创建写手/审查者专用零工具 preset 并强制执行子代理工具隔离；**宿主版本过旧时 DACW 会触发 Fail-Closed 拒绝运行**（不会静默降级为继承父会话工具），以保证隔离的安全底线。
+
 前置：DSH 提供 `ctx.subagents`、`agentPresets` 服务与 `spawn` provider（`@deepseek-ai/dsh-subagent-spawn-in-process`）；构建需要 Node ≥ 22.13；被测试项目的依赖需人工预装。
 
 ```bash
