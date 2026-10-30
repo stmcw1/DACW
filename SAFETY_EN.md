@@ -35,21 +35,21 @@ Differences go straight to the human gate instead of back to the writer for thre
 
 ## Sandbox (where tests execute)
 
-By default DACW does not isolate: tests run writer-produced code with the privileges of the host user. Container isolation is an optional configuration (sandbox branch).
+Sandbox is on by default: tests run in a one-shot container by default; when the sandbox is unavailable DACW **neither crashes nor silently degrades** — it shows a human confirmation ("disable sandbox?"); keeping the sandbox or being unable to ask fails closed, and only an explicit user confirmation runs on the host, flagged as a security downgrade.
 
 `config.sandbox` decides where tests run:
 
 | Mode | Behavior | Isolation |
 |---|---|---|
-| `host` (default) | Run on the host: writer-produced code runs with the full privileges of the host user | **None** |
-| `docker` (optional, sandbox branch) | Force a one-shot container; fail at startup if Docker is unavailable | Container-grade (see below) |
-| `auto` (optional, sandbox branch) | Docker available → one-shot container; unavailable → **tests are refused** (fail-closed, workflow goes to the human gate) | Container-grade (see below) |
+| `auto` (default) | Docker available → one-shot container; unavailable → human confirmation; keep/unavailable → **tests are refused** (fail-closed) | Container-grade (see below) |
+| `docker` | Force a one-shot container; unavailable → same confirmation flow | Container-grade (see below) |
+| `host` | Explicit host execution: writer-produced code runs with the full privileges of the host user (no prompt; red startup warning) | **None** |
 
 Container constraints in docker mode: `--network none` (no network), read-only root filesystem (only a /tmp tmpfs is writable), non-root user (uid/gid 1000), `--cap-drop ALL`, `no-new-privileges`, memory / CPU / PID limits, `--rm` one-shot; the workspace is first copied into a disposable staging directory and that copy is mounted — **the host workspace itself never enters the container**.
 
 **docker mode is not perfect isolation either**: containers share the host kernel, the image must be trusted (use only official or reviewed images), and the Docker Desktop file-sharing layer has its own attack surface; pre-pull the image before first use or the pull time may trip the test timeout.
 
-host is the default strategy of the mainline: arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user. Explicitly setting `mode: "host"` produces a red startup warning; using the default value logs only a plain informational line. The result message states where the tests executed. In host mode the command whitelist, environment whitelist, HMAC signing, review and human gate reduce risk but **do not constitute isolation**; do not treat DACW as the sole security control for untrusted workloads.
+After the user confirms disabling the sandbox (or explicitly sets `mode: "host"`), arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user; the result message is flagged as a security downgrade / states where tests executed, and the log carries a red warning. In host mode the command whitelist, environment whitelist, HMAC signing, review and human gate reduce risk but **do not constitute isolation**; do not treat DACW as the sole security control for untrusted workloads.
 
 ## Key boundaries
 

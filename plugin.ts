@@ -24,8 +24,8 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { apply as createEngine } from './index';
-import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig } from './sandbox';
-import type { SandboxConfig } from './sandbox';
+import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
+import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
 const PLUGIN_VERSION = '1.1.0';
 const WRITER_PRESET_ID = 'dacw-writer';
@@ -164,7 +164,7 @@ function normalizeModelConfig(value: unknown, warnings: string[], field: string)
 export function normalizePluginConfig(raw: unknown): { config: PluginConfig; warnings: string[]; sandboxExplicit: boolean } {
     const warnings: string[] = [];
     const input = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
-    // 只有用户显式写了 sandbox.mode === 'host' 才算"显式选择宿主执行"；默认值（host）不告警。
+    // 只有用户显式写了 sandbox.mode === 'host' 才算"显式选择宿主执行"；默认值（auto，沙盒开启）不告警。
     const rawSandbox = input.sandbox;
     const sandboxExplicit = !!rawSandbox && typeof rawSandbox === 'object' && !Array.isArray(rawSandbox)
         && (rawSandbox as Record<string, unknown>).mode === 'host';
@@ -870,8 +870,10 @@ function renderToolResultText(value: any): string {
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
     '独立审查者子代理审计全量文件并给出 JSON 裁决 → 通过后停在人工闸门（NEED_HUMAN），绝不自动合入。' +
-    '测试在任何审查之前执行；默认在宿主直接执行（无隔离）：测试以宿主用户权限运行写手产出代码；' +
-    '设置 sandbox.mode:"docker" 或 "auto" 可启用一次性容器（sandbox 分支）。审查者审计是侦探性控制，不是执行前屏障。' +
+    '测试在任何审查之前执行；默认开启沙盒（sandbox.mode:"auto"）：Docker 可用时在一次性容器内跑测试' +
+    '（无网络、只读根文件系统、非 root、资源受限）；检测到无 Docker/沙盒不可用时不崩溃、不静默降级，' +
+    '而是通过 ctx.userQuestions 弹出「是否关闭沙盒」确认——确认关闭后才以宿主权限执行并标注安全降级，' +
+    '选择保持或无法交互则 fail-closed 停止。审查者审计是侦探性控制，不是执行前屏障。' +
     '当需要"让模型写代码、让真实测试验证、让独立审查者把关、最后人工确认"时使用本工具。' +
     '注意：DACW 每轮都会把工作区内容重置为产出文件集（仅保留 package.json 等地基文件与 .git/node_modules），' +
     '因此必须指向专用空目录（工具会写入 .dacw-workspace 标记）；不要在存放重要文件的目录上运行。' +
@@ -1094,6 +1096,33 @@ export function apply(ctx: any, rawConfig?: unknown) {
                         role, text, dacwChildren, logger,
                         roleModel: role === 'writer' ? roleModels.writer : roleModels.reviewer,
                     });
+                },
+                /**
+                 * 沙盒不可用来询问人类：「是否关闭沙盒」。
+                 * 通过 DSH 的 ctx.userQuestions seam 弹出确认；服务缺失时返回 unavailable，
+                 * 由引擎 fail-closed 停止（不崩溃、不静默降级）。
+                 */
+                async askUserQuestion(request: SandboxConsentRequest): Promise<SandboxConsentResult> {
+                    const userQuestions: any = (() => { try { return ctx.get('userQuestions'); } catch { return undefined; } })();
+                    if (!userQuestions || typeof userQuestions.ask !== 'function') {
+                        return { decision: 'unavailable', reason: '宿主未提供 ctx.userQuestions 交互服务（无法弹出沙盒确认）' };
+                    }
+                    try {
+                        const answer = await userQuestions.ask({
+                            questions: [{
+                                id: 'dacw-sandbox-consent',
+                                question: request.message,
+                                header: request.title,
+                                options: request.options.map((option) => ({ label: option.label, description: option.description })),
+                            }],
+                            ...(agent ? { agent } : {}),
+                            ...(signal ? { signal } : {}),
+                        });
+                        return parseSandboxConsentAnswer(answer, request);
+                    } catch (error) {
+                        if ((signal && signal.aborted) || isAbortLike(error)) throw abortError();
+                        return { decision: 'unavailable', reason: `沙盒确认交互失败：${errorMessage(error)}` };
+                    }
                 },
                 log,
             };

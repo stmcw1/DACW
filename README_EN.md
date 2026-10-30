@@ -14,7 +14,7 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 
 - **Separation of powers**: the writer only emits a JSON changeset, the runner only executes whitelisted commands, the reviewer only emits a verdict — no single party can merge code.
 - **Zero-tool child isolation**: writer/reviewer run on persona-only presets; on `agent/created` the plugin uses `ctx.tools.restrict({ allow: [] })` to strip every inherited tool and verifies the child sees zero tools. If isolation fails, the child is never created.
-- **Configurable execution (host by default)**: `sandbox.mode` defaults to `"host"` — tests run writer-produced code with host-user privileges (no isolation). Set `"docker"` / `"auto"` to enable a one-shot container (no network, read-only root filesystem, non-root, cap-drop ALL, resource-limited; sandbox branch).
+- **Sandbox on by default (auto)**: `sandbox.mode` defaults to `"auto"` — when Docker is available tests run in a one-shot container (no network, read-only root filesystem, non-root, cap-drop ALL, resource-limited). When Docker/sandbox is unavailable DACW **neither crashes nor silently degrades**: it shows a human confirmation ("disable sandbox?"); keeping the sandbox or being unable to ask fails closed, and only an explicit disable runs on the host (flagged as a security downgrade in the result).
 - **Output protocol v2**: the writer emits only deltas against the baseline, untouched files are preserved byte-for-byte, which cuts tokens and prevents "the code that passed last round got broken" regressions.
 - **Deterministic runner**: command whitelist (npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go), environment whitelist, timeout tree-kill, output truncation.
 - **Structured review**: the verdict must be exact JSON; unparseable output is treated as REJECTED; PASS containing suspicious wording goes to the human gate.
@@ -46,7 +46,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 92 regression vectors
+node selftest.mjs                           # 96 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -84,18 +84,24 @@ On workflow failure the tool throws (including workspace, status, round and log 
 
 ## Sandbox configuration
 
-`config.sandbox` decides where tests execute (default `host`): with no configuration tests run on the host (no isolation); explicitly setting `mode: "host"` produces a red startup warning, while the default value does not warn.
+`config.sandbox` decides where tests execute (**`auto` by default — sandbox on**). When Docker is unavailable DACW **neither crashes nor silently degrades** to host execution; it asks the human through the DSH interaction seam:
+
+> No sandbox or Docker environment detected (detection output follows) — disable sandbox mode? (Warning: after disabling, AI-generated code touches the host system directly; only confirm while you are in a safe/isolated environment.)
+
+- "Keep sandbox" → the run is cancelled (fail-closed, no test code executes on the host);
+- "Disable sandbox and continue" → this run executes on the host user's privileges, flagged as **[security downgrade]** in the result;
+- Host cannot show the confirmation (no interaction capability) → the run is refused too.
 
 | Mode | Behavior |
 |---|---|
-| `host` (default) | Run on the host: writer-produced code runs with host-user privileges (no isolation; the result message states where tests executed) |
-| `docker` | Optional (sandbox branch): force a one-shot container; fail at startup when Docker is unavailable |
-| `auto` | Optional (sandbox branch): Docker available → one-shot container; unavailable → tests refused (fail-closed, workflow goes to the human gate) |
+| `auto` (default) | Docker available → one-shot container; unavailable → human confirmation (above); keep/unavailable → fail-closed |
+| `docker` | Force a one-shot container; unavailable → same confirmation flow |
+| `host` | Explicit host execution (no isolation, no prompt; red startup warning; use only when you fully trust the environment) |
 
 ```yaml
 config:
   sandbox:
-    mode: host                # host (default) | auto | docker
+    mode: auto                # auto (default) | docker | host
     image: ''                 # empty = pick an official image per test command; or pin e.g. node:22-bookworm-slim
     memoryMb: 1024
     cpus: 1                   # fractions allowed
@@ -126,12 +132,12 @@ Resolution happens at the start of every tool call, so DSH settings changes appl
 
 ## Safety
 
-By default DACW does not isolate: tests run writer-produced code with host-user privileges. Container isolation is an optional configuration (sandbox branch).
+Sandbox is on by default: when Docker is available tests run in a one-shot container; when the sandbox is unavailable DACW asks the human, and keeping it or being unable to ask fails closed (it never silently degrades to host execution).
 
 DACW executes model-generated code and commands. **Tests execute before any review**, so review (including the human gate) is a detective control, not a pre-execution security barrier; child tool isolation is not a code-execution security boundary.
 
-- Default `sandbox.mode: "host"`: arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user — a design choice of the current mainline.
-- Setting `sandbox.mode: "docker"` or `"auto"` enables a one-shot container; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
+- Default `sandbox.mode: "auto"`: tests run in a one-shot container by default; when Docker is unavailable DACW asks the human and refuses to run without confirmation — no silent degradation to host execution.
+- When the user explicitly disables the sandbox (or sets `sandbox.mode: "host"`), arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user, flagged as a **[security downgrade]** / red warning; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
 - Review completeness is fail-closed by default: truncated review input or a lockfile sent only as a digest makes `success` false and routes to the human gate; `allowTruncatedReview: true` explicitly lets it pass (**lowers the security guarantee**; message/files/logs are flagged).
 - Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
 
@@ -143,7 +149,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 |---|---|
 | `plugin.ts` | DSH Host half: tool registration, child presets, runtime tool isolation, model resolution, workspace gate |
 | `index.ts` | Orchestrator: rounds, baseline merge, runner dispatch, verdict, human gate |
-| `sandbox.ts` | Sandbox policy: host (default)/docker/blocked decision, container args, Docker detection |
+| `sandbox.ts` | Sandbox policy: auto (default)/docker/host decision, container args, Docker detection, sandbox consent request |
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
 | `state_manager.ts` | State: atomic writes, HMAC, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |

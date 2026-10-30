@@ -25,8 +25,8 @@ import * as fsSync from 'fs';
 import * as crypto from 'crypto';
 import { Runner } from './runner';
 import { StateManager } from './state_manager';
-import { DEFAULT_SANDBOX_CONFIG, describePolicy, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
-import type { SandboxConfig } from './sandbox';
+import { DEFAULT_SANDBOX_CONFIG, buildSandboxConsentRequest, describePolicy, detectDocker, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
+import type { ExecutionPolicy, SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
 /**
  * 协调器对宿主的最小依赖面。
@@ -38,7 +38,16 @@ import type { SandboxConfig } from './sandbox';
 export interface DSHContext {
     chat: (agentId: string, prompt: string, context: string) => Promise<string>;
     log: (msg: string) => void;
+    /**
+     * 可选的人类交互能力（插件侧接 ctx.userQuestions）：沙盒不可用时用于弹出
+     * 「是否关闭沙盒」确认。缺失时引擎 fail-closed 停止（绝不静默降级到宿主执行）。
+     */
+    askUserQuestion?: (request: SandboxConsentRequest) => Promise<SandboxConsentResult>;
 }
+
+/** Docker 探测结果 / 探测器（可注入，供回归测试或宿主自定义探测）。 */
+export type SandboxDetection = { ok: true; version: string } | { ok: false; reason: string };
+export type SandboxDetector = () => Promise<SandboxDetection>;
 
 /** 可调参数；全部通过 `apply(context, options)` 注入，便于宿主配置与回归自测。 */
 export interface EngineOptions {
@@ -66,6 +75,8 @@ export interface EngineOptions {
      * 打开即降低安全保证：只有显式配置才生效，且 message/日志/files 会持续标注。
      */
     allowTruncatedReview: boolean;
+    /** 沙盒探测函数（回归测试 / 宿主自定义）；null 表示使用内置 detectDocker。 */
+    sandboxDetect: SandboxDetector | null;
 }
 
 export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
@@ -83,6 +94,7 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
     sandbox: DEFAULT_SANDBOX_CONFIG,
     sandboxExplicit: false,
     allowTruncatedReview: false,
+    sandboxDetect: null,
 };
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -114,6 +126,7 @@ export function resolveEngineOptions(partial?: Partial<EngineOptions> | null): E
         sandbox: normalizeSandboxConfig(partial.sandbox, [], 'sandbox'),
         sandboxExplicit: partial.sandboxExplicit === true,
         allowTruncatedReview: partial.allowTruncatedReview === true,
+        sandboxDetect: typeof partial.sandboxDetect === 'function' ? partial.sandboxDetect : null,
     };
 }
 
@@ -662,20 +675,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     const RUN_KEY = crypto.randomBytes(32);
     const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir, RUN_KEY);
 
-    // 测试执行策略只解析一次（探测 docker 守护进程）；blocked 时在写手轮次前快速失败。
-    const sandboxPlan = await resolveExecutionPolicy(options.sandbox);
-    logSystem(context, `🛡️ 测试执行策略：${describePolicy(sandboxPlan)}`);
-    if (sandboxPlan.kind === 'host') {
-        if (options.sandboxExplicit) {
-            logError(context, '[警告] 你显式配置了 sandbox.mode="host"：测试将以宿主用户全权限直接执行（无隔离），'
-                + '写手产出的任意代码——包括 package.json 的 test/pretest 等脚本——都将在你的账号下运行。'
-                + '子代理工具隔离与审查者审计均不构成对测试进程的约束。');
-        } else {
-            logSystem(context, '测试将在宿主直接执行（默认策略，无隔离）；'
-                + '如需容器隔离请设置 config.sandbox.mode: "docker" 或 "auto"（sandbox 分支）。');
-        }
-    }
-    const runner = new Runner(workspaceDir, sandboxPlan);
+    // 沙盒策略在 stateManager.init 之后解析：blocked 时需要记录 NEED_HUMAN 状态并等待人类确认。
+    let sandboxPlan: ExecutionPolicy;
+    let sandboxDisabledByConsent = false;
+    let runner: Runner;
 
     let baseFiles = new Map<string, string>();
     /** 对账后的最终交付清单；null 表示本轮尚未完成对账（此时回退到写手基线清单）。 */
@@ -694,14 +697,42 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     try {
         await stateManager.init(taskPrompt);
 
+        // 测试执行策略只解析一次（探测 docker 守护进程）。沙盒不可用时不崩溃、不静默降级：
+        // 先通过宿主交互 seam（ctx.userQuestions）弹出「是否关闭沙盒」确认；拒绝/无法确认则 fail-closed 停止。
+        sandboxPlan = await resolveExecutionPolicy(options.sandbox, options.sandboxDetect ?? detectDocker);
+        logSystem(context, `🛡️ 测试执行策略：${describePolicy(sandboxPlan)}`);
         if (sandboxPlan.kind === 'blocked') {
-            // fail fast：不烧写手轮次——写手无法修复"宿主上没有沙箱"这件事。
-            const message = '沙箱不可用，测试未执行（fail-closed）：' + sandboxPlan.reason + '。'
-                + '你选择了容器模式（sandbox.mode="auto"/"docker"），当前环境无法提供容器，工作流在测试阶段拒绝运行。'
-                + '处理方式：安装/启动 Docker；或改用 sandbox.mode: "host"（宿主直执，无隔离）接受宿主执行。';
-            await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = '沙箱不可用，测试未执行'; });
-            logError(context, message);
-            return finish(false, message, 0);
+            const consentRequest = buildSandboxConsentRequest(sandboxPlan);
+            logError(context, `[沙盒] ${consentRequest.message}\n${consentRequest.detail}`);
+            let consent: SandboxConsentResult;
+            if (typeof context.askUserQuestion === 'function') {
+                try {
+                    consent = await context.askUserQuestion(consentRequest);
+                } catch (e: any) {
+                    consent = { decision: 'unavailable', reason: `交互确认失败：${e?.message ?? String(e)}` };
+                }
+            } else {
+                consent = { decision: 'unavailable', reason: '宿主未提供交互确认能力（ctx.userQuestions 不可用）' };
+            }
+            if (consent.decision === 'disable_sandbox') {
+                sandboxDisabledByConsent = true;
+                sandboxPlan = { kind: 'host' };
+                logError(context, '[安全降级] 用户已确认关闭沙盒模式：本次运行将以宿主用户全权限执行 AI 生成的测试代码，直接接触宿主系统。');
+            } else {
+                const why = consent.decision === 'keep_sandbox' ? '用户选择保持沙盒模式（取消本次运行）' : consent.reason;
+                const message = `${consentRequest.message}\n${consentRequest.detail}\n处理结果：未关闭沙盒（${why}）。`
+                    + '已拒绝运行，未在宿主执行任何测试代码。可安装/启动 Docker 后重试；'
+                    + '或在明确接受风险后显式设置 config.sandbox.mode: "host"（宿主直执，无隔离）。';
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = '沙盒不可用且未获关闭确认，测试未执行'; });
+                logError(context, message);
+                return finish(false, message, 0);
+            }
+        }
+        runner = new Runner(workspaceDir, sandboxPlan);
+        if (sandboxPlan.kind === 'host' && !sandboxDisabledByConsent && options.sandboxExplicit) {
+            logError(context, '[警告] 你显式配置了 sandbox.mode="host"：测试将以宿主用户全权限直接执行（无隔离），'
+                + '写手产出的任意代码——包括 package.json 的 test/pretest 等脚本——都将在你的账号下运行。'
+                + '子代理工具隔离与审查者审计均不构成对测试进程的约束。');
         }
 
         for (let round = 1; round <= options.maxRounds; round++) {
@@ -1074,9 +1105,11 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 : '';
             const sandboxNote = sandboxPlan.kind === 'docker'
                 ? '（测试在一次性容器内执行：无网络、只读根文件系统、非 root、资源受限）'
-                : options.sandboxExplicit
-                    ? '（警告：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
-                    : '（默认策略：测试以宿主用户权限执行，未做隔离）';
+                : sandboxDisabledByConsent
+                    ? '（【安全降级】用户已确认关闭沙盒：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
+                    : options.sandboxExplicit
+                        ? '（警告：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
+                        : '（默认策略：测试以宿主用户权限执行，未做隔离）';
             return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}`, round);
         }
 

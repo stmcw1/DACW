@@ -12,9 +12,9 @@
         workspacePolicy: guarded
         maxRounds: 3
         subagentProvider: spawn
-        # 测试执行策略（默认 host：宿主直执，无隔离；auto/docker 为可选容器模式，sandbox 分支开发）
+        # 测试执行策略（默认 auto：沙盒开启；Docker 不可用时弹出人类确认，保持/无法确认则 fail-closed，绝不静默降级）
         # sandbox:
-        #   mode: host          # host（默认）| auto | docker（显式写 host 会有一条红色警告，默认值不告警）
+        #   mode: auto          # auto（默认）| docker | host（显式 host 无隔离、不询问、有红色警告）
         #   image: ''           # 空 = 按测试命令自动选择官方镜像；也可固定如 node:22-bookworm-slim
         #   memoryMb: 1024
         #   cpus: 1

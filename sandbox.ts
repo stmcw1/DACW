@@ -6,14 +6,14 @@
  * 因此审查是【侦探性控制】，绝不是执行前的安全屏障。子代理工具隔离只约束子代理
  * 能否调用宿主工具，同样不能约束测试进程本身。唯一有效的预防性控制是隔离执行：
  *
- *   - mode 'host'（默认，主线）：宿主直执，无隔离；'auto'/'docker' 在 sandbox 分支开发。
- *     测试以宿主用户全权限运行写手产出的任意代码。
- *   - mode 'docker'：一次性容器执行。无网络（--network none）、只读根文件系统、
- *     非 root 用户（uid/gid 1000）、cap-drop ALL、no-new-privileges、
- *     内存 / CPU / 进程数上限；工作区先复制到一次性暂存目录再挂载进容器，
- *     宿主工作区本身不进入容器。
- *   - mode 'auto'：Docker 可用 → docker；不可用 → 'blocked'（拒绝执行测试，
- *     fail-closed，绝不静默回退到宿主执行）。
+ *   - mode 'auto'（默认，沙盒开启）：Docker 可用 → 一次性容器执行（见下）；不可用时
+ *     系统不会崩溃、也不会静默降级，而是弹出「是否关闭沙盒」的人类确认（consent 流程）：
+ *     用户确认关闭才改为宿主直执并标注安全降级；选择保持或无法确认则 fail-closed 停止。
+ *   - mode 'docker'：强制一次性容器执行（无网络、只读根文件系统、非 root/uid 1000、
+ *     cap-drop ALL、no-new-privileges、内存/CPU/进程数上限；工作区复制到一次性暂存目录
+ *     再挂载，宿主工作区本身不进入容器）；Docker 不可用同样进入上述确认流程。
+ *   - mode 'host'：显式宿主直执（无隔离）——用户显式接受风险；测试以宿主用户全权限
+ *     运行写手产出的任意代码。
  *
  * [边界] Docker 容器不是完美隔离：它共享宿主内核，镜像本身必须可信（仅使用
  * 官方镜像或经过审查的镜像），Docker Desktop 的文件共享层也有自身攻击面。
@@ -31,7 +31,11 @@ export const SANDBOX_MODES = ['auto', 'docker', 'host'] as const;
 export type SandboxMode = (typeof SANDBOX_MODES)[number];
 
 export interface SandboxConfig {
-    /** host（默认）：宿主直执（无隔离）；auto：docker 可用则容器化否则拒绝执行；docker：强制容器（sandbox 分支）。 */
+    /**
+     * auto（默认，沙盒开启）：Docker 可用则容器化；不可用时不崩溃、不静默降级，
+     * 而是弹出确认询问是否关闭沙盒（见 index.ts 的 consent 流程）。
+     * docker：强制容器（不可用时同样进入确认流程）；host：显式宿主直执（无隔离）。
+     */
     mode: SandboxMode;
     /** 容器镜像；空串表示按测试命令自动选择官方镜像。 */
     image: string;
@@ -44,7 +48,7 @@ export interface SandboxConfig {
 }
 
 export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
-    mode: 'host',
+    mode: 'auto',
     image: '',
     memoryMb: 1024,
     cpus: 1,
@@ -56,7 +60,75 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
 export type ExecutionPolicy =
     | { kind: 'host' }
     | { kind: 'docker'; image: string; memoryMb: number; cpus: number; pidsLimit: number; tmpfsMb: number }
-    | { kind: 'blocked'; reason: string };
+    | { kind: 'blocked'; reason: string; mode: SandboxMode };
+
+/** 沙盒不可用时的确认选项（model/UI 中展示）。 */
+export interface SandboxConsentOption {
+    id: 'keep_sandbox' | 'disable_sandbox';
+    label: string;
+    description: string;
+}
+
+/** 交给宿主交互 seam（ctx.userQuestions）的确认请求。 */
+export interface SandboxConsentRequest {
+    title: string;
+    message: string;
+    detail: string;
+    options: SandboxConsentOption[];
+}
+
+/** 用户对「是否关闭沙盒」的回答；unavailable 表示无法取得人类回答（fail-closed）。 */
+export type SandboxConsentResult =
+    | { decision: 'keep_sandbox' }
+    | { decision: 'disable_sandbox' }
+    | { decision: 'unavailable'; reason: string };
+
+/**
+ * 构造「沙盒不可用 → 是否关闭沙盒」的确认请求。警告文案固定为产品口径，
+ * `detail` 携带实际检测结果（以检测内容输出）。
+ */
+export function buildSandboxConsentRequest(plan: Extract<ExecutionPolicy, { kind: 'blocked' }>): SandboxConsentRequest {
+    return {
+        title: '沙盒不可用',
+        message: '检测到当前环境无沙盒或者 Docker环境（以检测内容输出），是否关闭沙盒模式？'
+            + '（警告：关闭后，AI 生成的代码将直接接触宿主系统，请在确认处于安全/隔离环境时再选择关闭）',
+        detail: `检测结果（sandbox.mode="${plan.mode}"）：${plan.reason}`,
+        options: [
+            {
+                id: 'keep_sandbox',
+                label: '保持沙盒（取消本次运行）',
+                description: '不会在宿主上执行任何测试代码；安装/启动 Docker 后可重试。',
+            },
+            {
+                id: 'disable_sandbox',
+                label: '关闭沙盒并继续',
+                description: '本次运行的测试将以宿主用户全权限执行，AI 生成的代码会直接接触宿主系统（安全降级，结果会标注）。',
+            },
+        ],
+    };
+}
+
+/**
+ * 解析人类回答（宿主 ask() 返回值：{ answers: [{ id, selected: string[] }] }）。
+ * 只认本次请求的选项 label；未选中/无回答/未知答案一律视为 keep_sandbox（fail-closed）。
+ */
+export function parseSandboxConsentAnswer(
+    answer: unknown,
+    request: SandboxConsentRequest,
+    questionId = 'dacw-sandbox-consent',
+): SandboxConsentResult {
+    if (!answer || typeof answer !== 'object') return { decision: 'keep_sandbox' };
+    const answers = (answer as any).answers;
+    if (!Array.isArray(answers)) return { decision: 'keep_sandbox' };
+    const hit = answers.find((item: any) => item && item.id === questionId);
+    if (!hit || !Array.isArray(hit.selected)) return { decision: 'keep_sandbox' };
+    const selectedLabels: string[] = hit.selected.filter((label: unknown): label is string => typeof label === 'string');
+    const disableOption = request.options.find((option) => option.id === 'disable_sandbox');
+    const keepOption = request.options.find((option) => option.id === 'keep_sandbox');
+    if (disableOption && selectedLabels.includes(disableOption.label)) return { decision: 'disable_sandbox' };
+    if (keepOption && selectedLabels.includes(keepOption.label)) return { decision: 'keep_sandbox' };
+    return { decision: 'keep_sandbox' };
+}
 
 function pushWarning(warnings: string[], prefix: string, message: string): void {
     warnings.push(prefix ? `${prefix}.${message}` : message);
@@ -246,24 +318,21 @@ export function detectDocker(timeoutMs = 4000): Promise<{ ok: true; version: str
 
 /**
  * 解析本次调用的执行策略：
- *   - host（默认）→ 直接宿主执行（无隔离；是否由用户显式指定由调用方另行标注）；
- *   - docker → Docker 不可用即抛错（显式要求容器就必须给容器，fail-closed）；
- *   - auto → Docker 可用则容器化，否则返回 blocked（调用方应快速失败，不烧写手轮次）。
+ *   - host → 直接宿主执行（仅显式配置；用户已接受无隔离风险）；
+ *   - auto（默认）/ docker → Docker 可用则容器化；不可用返回 blocked——不崩溃、不静默降级，
+ *     由调用方发起「是否关闭沙盒」的人类确认；拒绝或无法确认则 fail-closed 停止。
+ * `detect` 可注入（回归测试 / 宿主自定义探测），默认 detectDocker。
  */
-export async function resolveExecutionPolicy(config: SandboxConfig): Promise<ExecutionPolicy> {
+export async function resolveExecutionPolicy(
+    config: SandboxConfig,
+    detect: () => Promise<{ ok: true; version: string } | { ok: false; reason: string }> = detectDocker,
+): Promise<ExecutionPolicy> {
     if (config.mode === 'host') return { kind: 'host' };
-    const detection = await detectDocker();
-    if (config.mode === 'docker') {
-        if (!detection.ok) {
-            throw new Error(`[DACW] config.sandbox="docker" 强制容器执行，但 Docker 不可用：${detection.reason}。`
-                + `请安装/启动 Docker，或改用 sandbox:"auto"。`);
-        }
+    const detection = await detect();
+    if (detection.ok) {
         return { kind: 'docker', image: config.image, memoryMb: config.memoryMb, cpus: config.cpus, pidsLimit: config.pidsLimit, tmpfsMb: config.tmpfsMb };
     }
-    if (!detection.ok) {
-        return { kind: 'blocked', reason: detection.reason };
-    }
-    return { kind: 'docker', image: config.image, memoryMb: config.memoryMb, cpus: config.cpus, pidsLimit: config.pidsLimit, tmpfsMb: config.tmpfsMb };
+    return { kind: 'blocked', reason: detection.reason, mode: config.mode };
 }
 
 /** 生成一次性容器名（随机，防并发冲突；超时兜底 `docker rm -f` 用）。 */

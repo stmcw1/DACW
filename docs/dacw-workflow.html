@@ -5398,8 +5398,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <h3>执行位置与工作区</h3>
         </div>
         <ul>
-          <li>默认 sandbox.mode=host：测试以宿主权限执行，无隔离</li>
-          <li>docker / auto 可选一次性容器：无网络、只读根文件系统、非 root</li>
+          <li>沙盒默认开启（sandbox.mode=auto）：Docker 可用时一次性容器执行，无网络、只读根文件系统、非 root</li>
+          <li>Docker 不可用时弹出确认；保持或无法确认则 fail-closed，绝不静默降级为宿主执行</li>
           <li>每轮把工作区重置为合并后的文件集，未提及文件逐字节保留</li>
         </ul>
       </div>

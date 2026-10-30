@@ -25,6 +25,7 @@ const {
 } = plugin;
 const {
     normalizeSandboxConfig, buildDockerRunArgv, defaultImageForCommand, describePolicy, DEFAULT_SANDBOX_CONFIG,
+    buildSandboxConsentRequest, parseSandboxConsentAnswer,
 } = sandbox;
 const { Runner } = runnerModule;
 
@@ -194,9 +195,9 @@ t('插件配置：工具隔离默认开启，仅显式 false 关闭', () => {
 });
 
 // ================= 沙箱策略：测试执行位置（安全边界核心） =================
-t('沙箱配置：缺省用默认值（host）', () => {
+t('沙箱配置：缺省用默认值（auto，沙盒开启）', () => {
     eq(normalizeSandboxConfig(null, [], 'x'), DEFAULT_SANDBOX_CONFIG);
-    assert.equal(DEFAULT_SANDBOX_CONFIG.mode, 'host');
+    assert.equal(DEFAULT_SANDBOX_CONFIG.mode, 'auto');
 });
 t('沙箱配置：非法 mode / 数值回退并逐项告警', () => {
     const warnings = [];
@@ -255,10 +256,27 @@ t('引擎配置：sandboxExplicit 默认 false，仅显式 true 生效', () => {
     assert.equal(resolveEngineOptions({ sandboxExplicit: true }).sandboxExplicit, true);
     assert.equal(resolveEngineOptions({ sandboxExplicit: 'yes' }).sandboxExplicit, false);
 });
-t('插件配置：sandbox 默认 host 不告警；显式 host 才告警并标记 explicit', () => {
+t('沙盒确认：请求文案（检测内容输出）与回答解析（只有选关闭才 disable）', () => {
+    const request = buildSandboxConsentRequest({ kind: 'blocked', reason: 'PATH 上未找到 docker', mode: 'auto' });
+    assert.match(request.message, /检测到当前环境无沙盒或者 Docker环境/);
+    assert.match(request.message, /是否关闭沙盒模式/);
+    assert.match(request.message, /AI 生成的代码将直接接触宿主系统/);
+    assert.match(request.detail, /检测结果/);
+    assert.match(request.detail, /PATH 上未找到 docker/);
+    eq(request.options.map((option) => option.id), ['keep_sandbox', 'disable_sandbox']);
+    const disable = request.options.find((option) => option.id === 'disable_sandbox');
+    const keep = request.options.find((option) => option.id === 'keep_sandbox');
+    eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: [disable.label] }] }, request), { decision: 'disable_sandbox' });
+    eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: [keep.label] }] }, request), { decision: 'keep_sandbox' });
+    // 无回答 / 未知选项 / 结构非法 → 一律 keep（fail-closed）
+    eq(parseSandboxConsentAnswer(null, request), { decision: 'keep_sandbox' });
+    eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: ['某个未知选项'] }] }, request), { decision: 'keep_sandbox' });
+    eq(parseSandboxConsentAnswer({ answers: [] }, request), { decision: 'keep_sandbox' });
+});
+t('插件配置：sandbox 默认 auto（不告警）；显式 host 才告警并标记 explicit', () => {
     // workspacePolicy 显式给出，避免触发既有的"缺省 workspacePolicy"告警，隔离本用例的断言面
     const defaults = normalizePluginConfig({ workspacePolicy: 'guarded' });
-    assert.equal(defaults.config.sandbox.mode, 'host');
+    assert.equal(defaults.config.sandbox.mode, 'auto');
     assert.equal(defaults.sandboxExplicit, false);
     assert.equal(defaults.warnings.length, 0, JSON.stringify(defaults.warnings));  // 默认值不告警
     const explicit = normalizePluginConfig({ sandbox: { mode: 'host' } });
@@ -640,7 +658,7 @@ try {
         return binDir;
     };
 
-    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions) => {
+    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions, askUserQuestion) => {
         const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
         const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
         await fs.mkdir(wsDir, { recursive: true });
@@ -663,10 +681,14 @@ try {
                     return JSON.stringify({ changed: [{ file: 'main.js', code: 'console.log(1);\n' }], deleted: [] });
                 },
                 log: (message) => logs.push(message),
+                ...(askUserQuestion ? { askUserQuestion } : {}),
             };
             const execute = engine.apply(context, {
                 maxRounds: 1,
                 stateDir: path.join(tmpRoot, `state-recon-${tag}`),
+                // 回归测试默认显式走宿主策略，避免依赖本机 Docker 是否存在；
+                // 沙盒确认流程的用例会通过 extraOptions 覆盖 sandbox/sandboxDetect。
+                sandbox: { mode: 'host' },
                 ...(extraOptions ?? {}),
             });
             const result = await execute(`selftest-recon-${tag}`, wsDir, 'task');
@@ -801,6 +823,52 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.ok(logs.some((line) => line.includes('[安全降级]')), JSON.stringify(logs));
     });
 
+    // ---- 沙盒确认：Docker 不可用时不崩溃、不静默降级，而是询问人类是否关闭沙盒 ----
+    const failingDetect = async () => ({ ok: false, reason: '测试用：Docker 未安装' });
+    await ta('沙盒确认：用户选择关闭沙盒 → 宿主继续执行，message/日志标注安全降级', async () => {
+        const seen = { request: null };
+        const askUserQuestion = async (request) => {
+            seen.request = request;
+            return { decision: 'disable_sandbox' };
+        };
+        const { result, reviewerCalled, logs } = await runReconWorkflow('sandbox-disable', 'process.exit(0);', null, null, {
+            sandbox: { mode: 'auto' },
+            sandboxDetect: failingDetect,
+        }, askUserQuestion);
+        assert.ok(seen.request && seen.request.message.includes('检测到当前环境无沙盒'), '未弹出沙盒确认请求');
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /安全降级/);
+        assert.match(result.message, /关闭沙盒/);
+        assert.ok(logs.some((line) => line.includes('[安全降级]')), JSON.stringify(logs));
+    });
+    await ta('沙盒确认：用户选择保持沙盒 → 拒绝运行、未执行测试、message 含检测内容', async () => {
+        const askUserQuestion = async () => ({ decision: 'keep_sandbox' });
+        const { result, reviewerCalled } = await runReconWorkflow('sandbox-keep', 'process.exit(0);', null, null, {
+            sandbox: { mode: 'auto' },
+            sandboxDetect: failingDetect,
+        }, askUserQuestion);
+        assert.equal(reviewerCalled, false);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /检测到当前环境无沙盒/);
+        assert.match(result.message, /未关闭沙盒/);
+        assert.match(result.message, /保持沙盒/);
+    });
+    await ta('沙盒确认：宿主无交互能力 → fail-closed 拒绝（不崩溃、不静默降级）', async () => {
+        const { result, reviewerCalled } = await runReconWorkflow('sandbox-noask', 'process.exit(0);', null, null, {
+            sandbox: { mode: 'auto' },
+            sandboxDetect: failingDetect,
+        });
+        assert.equal(reviewerCalled, false);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /检测到当前环境无沙盒/);
+        assert.match(result.message, /未关闭沙盒/);
+        assert.match(result.message, /交互确认能力/);
+    });
+
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
         const logs = [];
         const context = { chat: async () => '不是 JSON', log: (message) => logs.push(message) };
@@ -818,17 +886,22 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             `日志里没有模型配置行：${JSON.stringify(logs)}`,
         );
     });
-    await ta('引擎审计日志：默认 host 只有普通提示；显式 host 出现红色警告', async () => {
+    await ta('引擎审计日志：默认 auto 沙盒策略；显式 host 出现红色警告', async () => {
         const runEngine = async (options, tag) => {
             const logs = [];
             const context = { chat: async () => '不是 JSON', log: (message) => logs.push(message) };
-            const execute = engine.apply(context, { maxRounds: 1, stateDir: path.join(tmpRoot, `state-grading-${tag}`), ...options });
+            const execute = engine.apply(context, {
+                maxRounds: 1,
+                stateDir: path.join(tmpRoot, `state-grading-${tag}`),
+                sandboxDetect: async () => ({ ok: true, version: 'selftest' }),
+                ...options,
+            });
             await execute(`selftest-grading-${tag}`, path.join(tmpRoot, `ws-grading-${tag}`), 'task');
             return logs;
         };
         const defaultLogs = await runEngine({}, 'default');
         assert.ok(defaultLogs.some((line) => line.includes('测试执行策略')), JSON.stringify(defaultLogs));
-        assert.ok(defaultLogs.some((line) => line.includes('默认策略，无隔离')), `缺默认策略提示：${JSON.stringify(defaultLogs)}`);
+        assert.ok(defaultLogs.some((line) => line.includes('一次性 Docker 容器')), `缺默认沙盒策略提示：${JSON.stringify(defaultLogs)}`);
         assert.equal(
             defaultLogs.some((line) => line.includes('你显式配置了 sandbox.mode="host"')),
             false, '默认值不应出现红色 host 警告');
