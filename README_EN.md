@@ -86,7 +86,7 @@ On workflow failure the tool throws (including workspace, status, round and log 
 
 `config.sandbox` decides where tests execute (**`auto` by default — sandbox on**). When Docker is unavailable DACW **neither crashes nor silently degrades** to host execution; it asks the human through the DSH interaction seam:
 
-> No sandbox or Docker environment detected (detection output follows) — disable sandbox mode? (Warning: after disabling, AI-generated code touches the host system directly; only confirm while you are in a safe/isolated environment.)
+> No usable sandboxed isolation environment was detected (e.g. Docker is not installed or not running). Disable sandbox mode and continue?
 
 - "Keep sandbox" → the run is cancelled (fail-closed, no test code executes on the host);
 - "Disable sandbox and continue" → this run executes on the host user's privileges, flagged as **[security downgrade]** in the result;

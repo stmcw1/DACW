@@ -90,8 +90,7 @@ export type SandboxConsentResult =
 export function buildSandboxConsentRequest(plan: Extract<ExecutionPolicy, { kind: 'blocked' }>): SandboxConsentRequest {
     return {
         title: '沙盒不可用',
-        message: '检测到当前环境无沙盒或者 Docker环境（以检测内容输出），是否关闭沙盒模式？'
-            + '（警告：关闭后，AI 生成的代码将直接接触宿主系统，请在确认处于安全/隔离环境时再选择关闭）',
+        message: '未检测到可用的沙盒隔离环境（如 Docker 未安装或未启动）。是否关闭沙盒模式并继续？',
         detail: `检测结果（sandbox.mode="${plan.mode}"）：${plan.reason}`,
         options: [
             {

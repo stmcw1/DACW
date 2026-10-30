@@ -258,14 +258,16 @@ t('引擎配置：sandboxExplicit 默认 false，仅显式 true 生效', () => {
 });
 t('沙盒确认：请求文案（检测内容输出）与回答解析（只有选关闭才 disable）', () => {
     const request = buildSandboxConsentRequest({ kind: 'blocked', reason: 'PATH 上未找到 docker', mode: 'auto' });
-    assert.match(request.message, /检测到当前环境无沙盒或者 Docker环境/);
-    assert.match(request.message, /是否关闭沙盒模式/);
-    assert.match(request.message, /AI 生成的代码将直接接触宿主系统/);
+    assert.match(request.message, /未检测到可用的沙盒隔离环境/);
+    assert.match(request.message, /Docker 未安装或未启动/);
+    assert.match(request.message, /是否关闭沙盒模式并继续/);
     assert.match(request.detail, /检测结果/);
     assert.match(request.detail, /PATH 上未找到 docker/);
     eq(request.options.map((option) => option.id), ['keep_sandbox', 'disable_sandbox']);
     const disable = request.options.find((option) => option.id === 'disable_sandbox');
     const keep = request.options.find((option) => option.id === 'keep_sandbox');
+    // 风险说明保留在「关闭沙盒」选项描述中（文案修改后仍不丢失警示）
+    assert.match(disable.description, /AI 生成的代码会直接接触宿主系统/);
     eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: [disable.label] }] }, request), { decision: 'disable_sandbox' });
     eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: [keep.label] }] }, request), { decision: 'keep_sandbox' });
     // 无回答 / 未知选项 / 结构非法 → 一律 keep（fail-closed）
@@ -835,7 +837,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             sandbox: { mode: 'auto' },
             sandboxDetect: failingDetect,
         }, askUserQuestion);
-        assert.ok(seen.request && seen.request.message.includes('检测到当前环境无沙盒'), '未弹出沙盒确认请求');
+        assert.ok(seen.request && seen.request.message.includes('未检测到可用的沙盒隔离环境'), '未弹出沙盒确认请求');
         assert.equal(reviewerCalled, true);
         assert.equal(result.success, true);
         assert.equal(result.status, 'NEED_HUMAN');
@@ -852,7 +854,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.equal(reviewerCalled, false);
         assert.equal(result.success, false);
         assert.equal(result.status, 'NEED_HUMAN');
-        assert.match(result.message, /检测到当前环境无沙盒/);
+        assert.match(result.message, /未检测到可用的沙盒隔离环境/);
         assert.match(result.message, /未关闭沙盒/);
         assert.match(result.message, /保持沙盒/);
     });
@@ -864,7 +866,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.equal(reviewerCalled, false);
         assert.equal(result.success, false);
         assert.equal(result.status, 'NEED_HUMAN');
-        assert.match(result.message, /检测到当前环境无沙盒/);
+        assert.match(result.message, /未检测到可用的沙盒隔离环境/);
         assert.match(result.message, /未关闭沙盒/);
         assert.match(result.message, /交互确认能力/);
     });
