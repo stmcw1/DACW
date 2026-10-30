@@ -22,7 +22,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { apply as createEngine } from './index';
 
-const PLUGIN_VERSION = '1.0.0';
+const PLUGIN_VERSION = '1.0.2';
 const WRITER_PRESET_ID = 'dacw-writer';
 const REVIEWER_PRESET_ID = 'dacw-reviewer';
 const WORKSPACE_MARKER = '.dacw-workspace';

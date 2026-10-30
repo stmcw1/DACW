@@ -45,7 +45,7 @@ node selftest.mjs                           # 60 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
-In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.0.0.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
+In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.0.2.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
 
 Upgrade: edit sources → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` the same tarball → restart the Harness.
 
