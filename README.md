@@ -1,4 +1,10 @@
 <div align="center">
+  <a href="https://stmcw1.github.io/DACW/dacw-workflow.html" target="_blank">
+    <img src="https://stmcw1.github.io/DACW/dacw.webp" alt="DACW 架构图" width="100%">
+  </a>
+  <p><i> 点击 or click</i></p>
+</div>
+<div align="center">
 
 # DACW — 防御性智能体编程工作流
 
