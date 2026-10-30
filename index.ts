@@ -61,6 +61,11 @@ export interface EngineOptions {
     sandbox: SandboxConfig;
     /** 用户是否显式配置了 sandbox.mode="host"（用于日志分级：显式 → 红色警告；默认值 → 普通提示）。 */
     sandboxExplicit: boolean;
+    /**
+     * G3 逃生门（默认关）：允许"审查不完整"（输入被截断 / 锁文件仅送摘要）时仍放行 success:true。
+     * 打开即降低安全保证：只有显式配置才生效，且 message/日志/files 会持续标注。
+     */
+    allowTruncatedReview: boolean;
 }
 
 export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
@@ -77,6 +82,7 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
     stateDir: null,
     sandbox: DEFAULT_SANDBOX_CONFIG,
     sandboxExplicit: false,
+    allowTruncatedReview: false,
 };
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -107,6 +113,7 @@ export function resolveEngineOptions(partial?: Partial<EngineOptions> | null): E
         stateDir: typeof stateDir === 'string' && stateDir.trim() !== '' ? stateDir : null,
         sandbox: normalizeSandboxConfig(partial.sandbox, [], 'sandbox'),
         sandboxExplicit: partial.sandboxExplicit === true,
+        allowTruncatedReview: partial.allowTruncatedReview === true,
     };
 }
 
@@ -831,9 +838,14 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             let actualCodes = '';
             let readFailed = false;
             let readErrorMsg = '';
-            let reviewTruncated = false;
+            let reviewTruncated = false;   // 审查输入被字符上限截断（单文件 / 总输入）
+            let reviewPartial = false;     // G2：锁文件只送 SHA256 摘要——不构成语义审查
             /** F3：记录审查循环实际遍历到的键集（与 postDigest / finalFiles 做三边界一致性断言）。 */
             const iteratedKeys: string[] = [];
+            /** G1：截断/未送审明细，用于 fail-closed 说明。 */
+            const truncatedFiles: string[] = [];
+            const unreviewedFiles: string[] = [];
+            const lockDigestFiles: string[] = [];
 
             // 审查输入有上限：超出时按文件头截断并在 payload 中显式标记，避免超大工作区
             // 把审查请求撑爆（或超时）却误报为“达到最大轮次”。
@@ -855,21 +867,49 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                     capped = code.slice(0, options.reviewFileMaxChars)
                         + `\n[...DACW 单文件超过 ${options.reviewFileMaxChars} 字符，已截断...]`;
                     reviewTruncated = true;
+                    truncatedFiles.push(`${label}（截断于 ${options.reviewFileMaxChars} 字符，原文件 ${code.length} 字符）`);
                 }
                 return appendReviewChunk(`\n\n--- 文件: ${label} ---\n${capped}`);
+            };
+            /** G1：截断/摘要送审的完整说明——未送审文件、单文件截断位置、总输入上限。 */
+            const describeReviewIncompleteness = (): string => {
+                const lines: string[] = [];
+                lines.push(`审查不完整：reviewTruncated=${reviewTruncated}，reviewPartial=${reviewPartial}。`);
+                if (unreviewedFiles.length > 0) {
+                    const shown = unreviewedFiles.slice(0, 20).join(', ');
+                    lines.push(`未送审文件（${unreviewedFiles.length}）：${shown}${unreviewedFiles.length > 20 ? ' …' : ''}`);
+                }
+                if (truncatedFiles.length > 0) {
+                    const shown = truncatedFiles.slice(0, 20).join('；');
+                    lines.push(`单文件截断（${truncatedFiles.length}）：${shown}${truncatedFiles.length > 20 ? ' …' : ''}`);
+                }
+                if (lockDigestFiles.length > 0) {
+                    lines.push(`仅摘要送审的锁文件（${lockDigestFiles.length}）：${lockDigestFiles.join(', ')}`
+                        + '（锁文件完整性由测试前后 SHA256 对账保证，未送语义审查）');
+                }
+                lines.push(`总输入上限：${actualCodes.length}/${options.reviewInputMaxChars} 字符`
+                    + (actualCodes.length >= options.reviewInputMaxChars ? '（已达上限）' : ''));
+                return lines.join('\n');
             };
 
             try {
                 const reviewed = new Set<string>();
+                const reviewKeys = Array.from(postDigest.keys());
                 // 审查输入只来自对账后的最终清单（不变量 6）；每个文件都从磁盘读当前内容，不复用内存基线。
-                for (const rel of postDigest.keys()) {
+                for (let i = 0; i < reviewKeys.length; i += 1) {
+                    const rel = reviewKeys[i];
                     iteratedKeys.push(rel);
                     const relDisplay = rel.split(path.sep).join('/');
                     // 锁文件只送 SHA256 摘要（下方单独处理），避免超大文件挤占审查输入
                     if (LOCK_REVIEW_DIGEST_SET.has(relDisplay)) continue;
                     try {
                         const code = await safeReadForReview(workspaceDir, rel);
-                        if (!appendReviewFile(relDisplay, code)) break;
+                        if (!appendReviewFile(relDisplay, code)) {
+                            // G1：总输入上限截断——记录当前文件与其余未送审文件（fail-closed 明细）。
+                            truncatedFiles.push(`${relDisplay}（受总输入上限 ${options.reviewInputMaxChars} 字符限制，未能完整送审）`);
+                            unreviewedFiles.push(...reviewKeys.slice(i + 1).map((key) => key.split(path.sep).join('/')));
+                            break;
+                        }
                         reviewed.add(relDisplay);
                     } catch (e: any) {
                         readFailed = true;
@@ -884,7 +924,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                         if (!fsSync.existsSync(path.join(path.resolve(workspaceDir), f))) continue;
                         try {
                             const code = await safeReadForReview(workspaceDir, f);
-                            if (!appendReviewFile(`${f}（地基文件）`, code)) break;
+                            if (!appendReviewFile(`${f}（地基文件）`, code)) {
+                                truncatedFiles.push(`${f}（地基文件，受总输入上限 ${options.reviewInputMaxChars} 字符限制）`);
+                                break;
+                            }
                             reviewed.add(f);
                         } catch (e: any) {
                             readFailed = true;
@@ -892,11 +935,13 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                             break;
                         }
                     }
-                    // [N-2] 锁文件只送 SHA256 摘要；读取失败同样 fail-closed 转人工（不得静默跳过）
+                    // [N-2] 锁文件只送 SHA256 摘要；G2：摘要送审不构成语义审查，标记 reviewPartial 并记录明细。
                     for (const f of LOCK_REVIEW_DIGEST_FILES) {
                         if (!fsSync.existsSync(path.join(path.resolve(workspaceDir), f))) continue;
                         try {
                             const digest = crypto.createHash('sha256').update(await safeReadBufferForReview(workspaceDir, f)).digest('hex');
+                            lockDigestFiles.push(f);
+                            reviewPartial = true;
                             if (!appendReviewChunk(`\n\n--- 文件: ${f}（SHA256 摘要，全文过长不送审） ---\n${digest}`)) break;
                         } catch (e: any) {
                             readFailed = true;
@@ -950,9 +995,23 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, '审查结果存在可疑信号（PASS 但含 REJECTED/BYPASS 字样），需人工确认', round);
             }
 
+            // G1/G2/G3：截断 / 摘要送审的 fail-closed 闸门——默认配置下任何"审查不完整"都禁止 PASS。
+            const reviewIncomplete = reviewTruncated || reviewPartial;
+            const escapedIncomplete = reviewIncomplete && options.allowTruncatedReview === true;
+            if (reviewIncomplete && !escapedIncomplete) {
+                const detail = describeReviewIncompleteness();
+                const message = `审查不完整，拒绝 success:true（默认 fail-closed）：\n${detail}\n`
+                    + '放行必须显式设置 config.allowTruncatedReview: true（降低安全保证）；'
+                    + '或缩小工作区 / 提高 reviewInputMaxChars、reviewFileMaxChars 后重试。';
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
+            }
+
             // F3：最终三边界一致性断言——postDigest === finalFiles === 审查遍历键集，
             // 且审查结束再枚举必须与 postDigest（及受保护目录指纹）一致（防审查期间被变动）。
             // 任一不等一律 success:false 转人工，绝不放行 success:true。
+            // （allowTruncatedReview=true 时允许遍历键集不完整，但 finalFiles 与再枚举一致性仍然强制。）
             let recheckDigest: Map<string, string>;
             let recheckProtected: Map<string, string>;
             try {
@@ -967,7 +1026,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             const boundaryProblems: string[] = [];
             const sameKeySet = (keys: string[], expected: Map<string, string>): boolean =>
                 keys.length === expected.size && keys.every((key) => expected.has(key));
-            if (!sameKeySet(iteratedKeys, postDigest)) {
+            if (!escapedIncomplete && !sameKeySet(iteratedKeys, postDigest)) {
                 boundaryProblems.push(`审查遍历键集与对账清单不一致（审查 ${iteratedKeys.length} 个 / 清单 ${postDigest.size} 个；`
                     + '审查输入可能因字符上限被截断，不能视为完整审查）');
             }
@@ -990,9 +1049,29 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, message, round);
             }
 
+            // G3 逃生门（显式开启时才存在）：放行不完整审查，但 message/日志/files 必须持续标注。
+            if (escapedIncomplete && finalFiles !== null) {
+                const annotate = new Map<string, string>();
+                for (const label of truncatedFiles) {
+                    const file = label.split('（')[0];
+                    if (file && !annotate.has(file)) annotate.set(file, '审查输入被截断，未完整送审');
+                }
+                for (const file of unreviewedFiles) {
+                    if (file && !annotate.has(file)) annotate.set(file, '未送审（审查输入上限）');
+                }
+                for (const file of lockDigestFiles) {
+                    if (!annotate.has(file)) annotate.set(file, '仅摘要送审，未语义审查');
+                }
+                finalFiles = finalFiles.map((file) => (annotate.has(file) ? `${file}（${annotate.get(file)}）` : file));
+                logError(context, '[安全降级] allowTruncatedReview=true：本次审查不完整（截断/仅摘要），仍按配置放行 success:true；'
+                    + '该结果不构成完整审查保证，合入前必须人工确认未送审内容。');
+            }
+
             await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });
             logSuccess(context, '全链路通过！进入人工闸门审核。');
-            const truncatedNote = reviewTruncated ? `（审查输入超过 ${options.reviewInputMaxChars} 字符上限被截断，请人工确认未送审的大文件）` : '';
+            const truncatedNote = escapedIncomplete
+                ? '（【安全降级】审查不完整：allowTruncatedReview=true 放行了截断/仅摘要送审；未送审项已标注在 files 中）'
+                : '';
             const sandboxNote = sandboxPlan.kind === 'docker'
                 ? '（测试在一次性容器内执行：无网络、只读根文件系统、非 root、资源受限）'
                 : options.sandboxExplicit

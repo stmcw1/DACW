@@ -88,6 +88,8 @@ export interface PluginConfig {
     enforceChildToolIsolation: boolean;
     /** 测试执行策略：默认 host（宿主直执，无隔离）；容器模式为可选配置（sandbox 分支）。 */
     sandbox: SandboxConfig;
+    /** G3 逃生门（默认 false）：允许截断/仅摘要的审查放行 success:true（降低安全保证）。 */
+    allowTruncatedReview: boolean;
 }
 
 export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
@@ -108,6 +110,7 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
     allowInheritedPresets: false,
     enforceChildToolIsolation: true,
     sandbox: DEFAULT_SANDBOX_CONFIG,
+    allowTruncatedReview: false,
 };
 
 function positiveIntOr(value: unknown, fallback: number, warnings: string[], field: string): number {
@@ -191,6 +194,7 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
         allowInheritedPresets: input.allowInheritedPresets === true,
         enforceChildToolIsolation: input.enforceChildToolIsolation !== false,
         sandbox: normalizeSandboxConfig(input.sandbox, warnings, 'config.sandbox'),
+        allowTruncatedReview: input.allowTruncatedReview === true,
     };
     if (config.chatTimeoutMaxMs < config.chatTimeoutBaseMs) {
         warnings.push('config.chatTimeoutMaxMs 小于 chatTimeoutBaseMs，已把 chatTimeoutMaxMs 提升到 base');
@@ -205,6 +209,10 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
     if (sandboxExplicit) {
         warnings.push('config.sandbox.mode="host"：测试将以宿主用户全权限直接执行写手产出的代码（无任何隔离）。'
             + '仅在你显式信任写手输出与工作区内容时使用。');
+    }
+    if (config.allowTruncatedReview) {
+        warnings.push('config.allowTruncatedReview=true：审查输入被截断或锁文件仅送摘要时仍会返回 success:true，'
+            + '安全保证降低（默认 fail-closed 拒绝）。');
     }
     return { config, warnings, sandboxExplicit };
 }
@@ -1101,6 +1109,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 roleModels: roleModelLabels,
                 sandbox: config.sandbox,
                 sandboxExplicit,
+                allowTruncatedReview: config.allowTruncatedReview,
             });
             const rawTaskId = taskIdArg || `dacw-${Date.now().toString(36)}`;
             const result = await executeTask(rawTaskId, workspaceDir, task);

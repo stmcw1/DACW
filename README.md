@@ -44,7 +44,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 89 项回归自测
+node selftest.mjs                           # 92 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
@@ -130,6 +130,7 @@ DACW 会执行模型生成的代码与命令。**测试在审查之前执行**�
 
 - 默认 `sandbox.mode: "host"`：写手产出的任意代码（含 `package.json` 的 test/pretest 脚本）以宿主用户全权限运行，这是当前主线的设计选择。
 - 设置 `sandbox.mode: "docker"` 或 `"auto"` 可启用一次性容器；docker 模式也不是完美隔离（共享宿主内核、镜像需可信）。
+- 审查完整性默认 fail-closed：审查输入被字符上限截断、或锁文件只送 SHA256 摘要时，`success` 恒为 false 并转人工；`allowTruncatedReview: true` 可显式放行（**降低安全保证**，message/files/日志会标注）。
 - 请在专用或一次性环境、最小权限账号下使用，并始终保留人工终审。
 
 完整边界、执行顺序与免责声明见 [SAFETY.md](SAFETY.md)。

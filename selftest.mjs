@@ -640,7 +640,7 @@ try {
         return binDir;
     };
 
-    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction) => {
+    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions) => {
         const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
         const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
         await fs.mkdir(wsDir, { recursive: true });
@@ -649,6 +649,7 @@ try {
         const prevPath = process.env.PATH;
         process.env.PATH = binDir + path.delimiter + path.dirname(process.execPath) + path.delimiter + (prevPath ?? '');
         try {
+            const logs = [];
             let reviewerCalled = false;
             let reviewerInput = '';
             const context = {
@@ -661,11 +662,15 @@ try {
                     }
                     return JSON.stringify({ changed: [{ file: 'main.js', code: 'console.log(1);\n' }], deleted: [] });
                 },
-                log: () => { },
+                log: (message) => logs.push(message),
             };
-            const execute = engine.apply(context, { maxRounds: 1, stateDir: path.join(tmpRoot, `state-recon-${tag}`) });
+            const execute = engine.apply(context, {
+                maxRounds: 1,
+                stateDir: path.join(tmpRoot, `state-recon-${tag}`),
+                ...(extraOptions ?? {}),
+            });
             const result = await execute(`selftest-recon-${tag}`, wsDir, 'task');
-            return { result, reviewerCalled, reviewerInput };
+            return { result, reviewerCalled, reviewerInput, logs };
         } finally {
             process.env.PATH = prevPath;
         }
@@ -757,6 +762,43 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.match(result.message, /最终一致性断言失败/);
         assert.match(result.message, /审查期间工作区文件发生变动/);
         assert.match(result.message, /late-append\.js/);
+    });
+
+    // ---- G 组：截断 / 摘要送审 fail-closed（G1–G3） ----
+    await ta('G1：单文件截断（reviewFileMaxChars 超限）→ 审查者 PASS 也 success:false', async () => {
+        const { result, reviewerCalled } = await runReconWorkflow('g1-trunc', 'process.exit(0);', null, null, { reviewFileMaxChars: 10 });
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /审查不完整/);
+        assert.match(result.message, /单文件截断/);
+        assert.match(result.message, /main\.js/);
+        assert.match(result.message, /总输入上限/);
+    });
+    await ta('G2：锁文件仅摘要送审 → 视为未完整审查、success:false', async () => {
+        const prepare = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, 'package-lock.json'), JSON.stringify({ name: 'fixture', lockfileVersion: 3 }), 'utf8');
+        };
+        const { result, reviewerCalled } = await runReconWorkflow('g2-lock', 'process.exit(0);', prepare);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /仅摘要送审的锁文件/);
+        assert.match(result.message, /package-lock\.json/);
+        assert.match(result.message, /未送语义审查/);
+        assert.match(result.message, /对账保证/);
+    });
+    await ta('G3：allowTruncatedReview=true 时截断可 PASS，但 message/files/日志必须标注降级', async () => {
+        const { result, reviewerCalled, logs } = await runReconWorkflow('g3-escape', 'process.exit(0);', null, null, {
+            reviewFileMaxChars: 10,
+            allowTruncatedReview: true,
+        });
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /安全降级/);
+        assert.ok(result.files.some((file) => file.includes('（审查输入被截断，未完整送审）')), JSON.stringify(result.files));
+        assert.ok(logs.some((line) => line.includes('[安全降级]')), JSON.stringify(logs));
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {

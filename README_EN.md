@@ -44,7 +44,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 89 regression vectors
+node selftest.mjs                           # 92 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -130,6 +130,7 @@ DACW executes model-generated code and commands. **Tests execute before any revi
 
 - Default `sandbox.mode: "host"`: arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user — a design choice of the current mainline.
 - Setting `sandbox.mode: "docker"` or `"auto"` enables a one-shot container; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
+- Review completeness is fail-closed by default: truncated review input or a lockfile sent only as a digest makes `success` false and routes to the human gate; `allowTruncatedReview: true` explicitly lets it pass (**lowers the security guarantee**; message/files/logs are flagged).
 - Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
 
 See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and disclaimer.

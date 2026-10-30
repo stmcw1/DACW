@@ -29,6 +29,8 @@ The ignore rules apply **only at the workspace root** (F1). The root `.dacw-work
 
 Before returning success, a final consistency assertion (F3) is enforced: `postDigest`, `finalFiles` and the key set actually iterated by the review loop must all agree, and a fresh enumeration (files plus protected-directory fingerprints) must exactly match the reconciled state; any mismatch (including truncated review input or workspace changes during review) → `success: false` to the human gate, never `success: true`.
 
+**Review completeness is likewise fail-closed (G).** When review input is truncated by a character cap (single file or total input), `reviewTruncated` is set; when a lockfile is sent only as a SHA256 digest it counts as not semantically reviewed (`reviewPartial`, with integrity guaranteed by the pre/post-test digest reconciliation). Under the default configuration neither path may pass: `success` is always false and the run goes to the human gate, with a report listing unreviewed files, per-file truncation positions and the total input cap. The only escape hatch is explicitly setting `allowTruncatedReview: true`: truncated/digest-only reviews may then pass, but the message is flagged as a security downgrade, `files` marks the unreviewed items and the log warns — **an explicit choice that lowers the security guarantee**, off by default.
+
 Differences go straight to the human gate instead of back to the writer for three reasons: test-time changes are not the writer's output, so the writer cannot see or explain them; they usually signal test-side injection/tampering or a broken test design and need human adjudication of the actual state; and sending them back would let the next round overwrite the evidence.
 
 ## Sandbox (where tests execute)

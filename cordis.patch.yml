@@ -20,6 +20,8 @@
         #   cpus: 1
         #   pidsLimit: 256
         #   tmpfsMb: 128
+        # G3 逃生门（默认 false）：允许截断/仅摘要的审查放行 success:true（降低安全保证，message/files/日志会标注）
+        # allowTruncatedReview: false
         # 可选：写手/审查者模型（默认继承父会话路由）
         # writerModel: deepseek-account/deepseek-flash   # 或 "deepseek-flash" 按 DSH 已配置模型目录解析 / "inherit"
         # reviewerModel: { model: deepseek-flash, reasoningEffort: high }
