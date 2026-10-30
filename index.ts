@@ -363,15 +363,23 @@ async function safeCleanWorkspace(workspaceDir: string) {
 
 // ================= 测试后对账（安全不变量 6：审查对象 === 最终交付物） =================
 /**
- * 对账时应忽略的工作区成员：版本库、人工预置的依赖、DACW 自己的工作区标记。
- * 这是最小忽略集——除此之外的一切都必须是「基线声明或测试前已存在」，多一个文件也算差异。
+ * F1：忽略集只在【根目录】生效（相对路径无分隔符）。子目录里的同名条目
+ * （如 nested/node_modules/...、sub/.git/...）不忽略，正常纳入对账与审查——
+ * 否则测试可以在嵌套 node_modules 里投放文件而完全绕过对账。
+ * `.dacw-workspace` 是 DACW 自己的根级标记文件，根层级忽略即可，无内容风险。
  */
-const WORKSPACE_DIGEST_IGNORED = new Set(['.git', 'node_modules', '.dacw-workspace']);
+const ROOT_DIGEST_IGNORED = new Set(['.dacw-workspace']);
+/**
+ * F2：根级 .git / node_modules 不是「无害」——按「存在性 + 顶层条目列表 + 摘要」
+ * 单独对账（fingerprintProtectedDirs），不递归内容；测试若增删顶层条目 → 转人工。
+ */
+const PROTECTED_ROOT_DIRS = ['.git', 'node_modules'];
 
 /**
  * 递归枚举工作区，返回「相对路径（统一用 / 分隔）→ 文件内容 SHA256」。
  * 安全语义：遇到符号链接或非普通文件项直接抛错（fail-closed）——对账对象必须可
- * 完整、确定地枚举；忽略集仅 WORKSPACE_DIGEST_IGNORED。
+ * 完整、确定地枚举；忽略仅在根级成立（F1），根级 .git / node_modules 交由
+ * fingerprintProtectedDirs 做指纹对账（F2），不递归其内容。
  */
 export async function enumerateWorkspace(root: string): Promise<Map<string, string>> {
     const resolvedRoot = path.resolve(root);
@@ -383,8 +391,12 @@ export async function enumerateWorkspace(root: string): Promise<Map<string, stri
     const walk = async (dir: string, relPrefix: string): Promise<void> => {
         const entries = await fs.readdir(dir, { withFileTypes: true });
         entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));   // 稳定顺序，便于对账与断言
+        const atRoot = relPrefix === '';
         for (const entry of entries) {
-            if (WORKSPACE_DIGEST_IGNORED.has(entry.name)) continue;
+            // F1：忽略只在根级成立，子目录同名条目不忽略。
+            if (atRoot && ROOT_DIGEST_IGNORED.has(entry.name)) continue;
+            // F2：根级 .git / node_modules 不进入文件摘要（单独做顶层条目指纹）。
+            if (atRoot && PROTECTED_ROOT_DIRS.includes(entry.name)) continue;
             const full = path.join(dir, entry.name);
             const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
             if (entry.isSymbolicLink()) throw new Error(`[安全拦截] 工作区包含符号链接，拒绝枚举：${rel}`);
@@ -399,6 +411,38 @@ export async function enumerateWorkspace(root: string): Promise<Map<string, stri
     };
     await walk(resolvedRoot, '');
     return digest;
+}
+
+/**
+ * F2：根级受保护目录（.git / node_modules）指纹 =「存在性 + 顶层条目列表 + 摘要」。
+ * 只读顶层 dirent，不递归内容、不跟随符号链接；目录不存在则不记录（缺失/新建由
+ * diffDigest 的 - / + 表达）。测试期增删顶层条目（或创建/删除整个目录）都会改变
+ * 指纹 → 对账转人工。
+ */
+export async function fingerprintProtectedDirs(
+    root: string,
+    names: string[] = PROTECTED_ROOT_DIRS,
+): Promise<Map<string, string>> {
+    const resolvedRoot = path.resolve(root);
+    const fingerprints = new Map<string, string>();
+    for (const name of names) {
+        let entries;
+        try {
+            entries = await fs.readdir(path.join(resolvedRoot, name), { withFileTypes: true });
+        } catch (e: any) {
+            if (e && e.code === 'ENOENT') continue;
+            throw new Error(`[安全拦截] 无法读取根级受保护目录 ${name} 的顶层条目：${e?.message ?? String(e)}`);
+        }
+        const listing = entries
+            .map((entry) => {
+                const kind = entry.isDirectory() ? 'd' : entry.isFile() ? 'f' : entry.isSymbolicLink() ? 'l' : 'o';
+                return `${kind}:${entry.name}`;
+            })
+            .sort()
+            .join('\n');
+        fingerprints.set(name, crypto.createHash('sha256').update(listing, 'utf8').digest('hex'));
+    }
+    return fingerprints;
 }
 
 /**
@@ -715,8 +759,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 baseDigest.set(rel.split(path.sep).join('/'), crypto.createHash('sha256').update(content, 'utf8').digest('hex'));
             }
             let preDigest: Map<string, string>;
+            let preProtected: Map<string, string>;
             try {
                 preDigest = await enumerateWorkspace(workspaceDir);
+                preProtected = await fingerprintProtectedDirs(workspaceDir);
             } catch (e: any) {
                 await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = `测试前快照失败：${e.message}`; });
                 logError(context, `测试前快照失败（工作区不可完整枚举），强制转人工：${e.message}`);
@@ -751,8 +797,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             // 5. 测试后对账（不变量 6）：测试可能改写工作区，审查对象必须 === 最终交付物。
             logProgress(context, round, options.maxRounds, startTime, '测试后对账中...');
             let postDigest: Map<string, string>;
+            let postProtected: Map<string, string>;
             try {
                 postDigest = await enumerateWorkspace(workspaceDir);
+                postProtected = await fingerprintProtectedDirs(workspaceDir);
             } catch (e: any) {
                 await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = `测试后对账失败：${e.message}`; });
                 logError(context, `测试后对账失败（最终交付物不可完整枚举），强制转人工：${e.message}`);
@@ -766,6 +814,15 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 logError(context, message);
                 return finish(false, message, round);
             }
+            // F2：根级 .git / node_modules 的「存在性 + 顶层条目列表」指纹对账（不递归内容）。
+            const protectedDiff = diffDigest(preProtected, postProtected);
+            if (protectedDiff.length > 0) {
+                const message = `测试后对账不通过：根级受保护目录（.git / node_modules）在测试期被改动`
+                    + `（${protectedDiff.length} 处差异），已阻止进入审查，需人工介入。\n${formatDigestDiff(protectedDiff)}`;
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
+            }
             finalFiles = Array.from(postDigest.keys());
             logSuccess(context, `测试后对账通过：${postDigest.size} 个交付文件与基线一致`);
 
@@ -775,6 +832,8 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             let readFailed = false;
             let readErrorMsg = '';
             let reviewTruncated = false;
+            /** F3：记录审查循环实际遍历到的键集（与 postDigest / finalFiles 做三边界一致性断言）。 */
+            const iteratedKeys: string[] = [];
 
             // 审查输入有上限：超出时按文件头截断并在 payload 中显式标记，避免超大工作区
             // 把审查请求撑爆（或超时）却误报为“达到最大轮次”。
@@ -804,6 +863,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 const reviewed = new Set<string>();
                 // 审查输入只来自对账后的最终清单（不变量 6）；每个文件都从磁盘读当前内容，不复用内存基线。
                 for (const rel of postDigest.keys()) {
+                    iteratedKeys.push(rel);
                     const relDisplay = rel.split(path.sep).join('/');
                     // 锁文件只送 SHA256 摘要（下方单独处理），避免超大文件挤占审查输入
                     if (LOCK_REVIEW_DIGEST_SET.has(relDisplay)) continue;
@@ -888,6 +948,46 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });
                 logError(context, '审查 verdict 为 PASS，但包含可疑字样，转人工闸门。');
                 return finish(false, '审查结果存在可疑信号（PASS 但含 REJECTED/BYPASS 字样），需人工确认', round);
+            }
+
+            // F3：最终三边界一致性断言——postDigest === finalFiles === 审查遍历键集，
+            // 且审查结束再枚举必须与 postDigest（及受保护目录指纹）一致（防审查期间被变动）。
+            // 任一不等一律 success:false 转人工，绝不放行 success:true。
+            let recheckDigest: Map<string, string>;
+            let recheckProtected: Map<string, string>;
+            try {
+                recheckDigest = await enumerateWorkspace(workspaceDir);
+                recheckProtected = await fingerprintProtectedDirs(workspaceDir);
+            } catch (e: any) {
+                const message = `最终一致性校验失败（审查期间工作区不可完整枚举），需人工介入：${e.message}`;
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
+            }
+            const boundaryProblems: string[] = [];
+            const sameKeySet = (keys: string[], expected: Map<string, string>): boolean =>
+                keys.length === expected.size && keys.every((key) => expected.has(key));
+            if (!sameKeySet(iteratedKeys, postDigest)) {
+                boundaryProblems.push(`审查遍历键集与对账清单不一致（审查 ${iteratedKeys.length} 个 / 清单 ${postDigest.size} 个；`
+                    + '审查输入可能因字符上限被截断，不能视为完整审查）');
+            }
+            if (finalFiles === null || !sameKeySet(finalFiles, postDigest)) {
+                boundaryProblems.push('finalFiles 与 postDigest 不一致');
+            }
+            const reviewWindowDiff = diffDigest(postDigest, recheckDigest);
+            if (reviewWindowDiff.length > 0) {
+                boundaryProblems.push(`审查期间工作区文件发生变动：\n${formatDigestDiff(reviewWindowDiff)}`);
+            }
+            const reviewWindowProtected = diffDigest(postProtected, recheckProtected);
+            if (reviewWindowProtected.length > 0) {
+                boundaryProblems.push(`审查期间受保护目录顶层条目发生变动：\n${formatDigestDiff(reviewWindowProtected)}`);
+            }
+            if (boundaryProblems.length > 0) {
+                const message = `最终一致性断言失败（${boundaryProblems.length} 项），拒绝 success:true，需人工介入。\n`
+                    + boundaryProblems.join('\n');
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
             }
 
             await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });

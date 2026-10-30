@@ -16,7 +16,7 @@ const runnerModule = await import('./dist/runner.js');
 
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
-    enumerateWorkspace, diffDigest,
+    enumerateWorkspace, diffDigest, fingerprintProtectedDirs,
 } = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
@@ -460,18 +460,23 @@ try {
     await ta('工作区闸门：拒绝用户主目录', async () => rejects(() => prepareWorkspace(tmpRoot, os.homedir(), 'guarded')));
     await ta('工作区闸门：拒绝文件系统根', async () => rejects(() => prepareWorkspace(tmpRoot, path.parse(tmpRoot).root, 'guarded')));
 
-    await ta('enumerateWorkspace：忽略三件套、路径统一 / 分隔、SHA256 正确、符号链接拒绝', async () => {
+    await ta('enumerateWorkspace：根级忽略、嵌套同名条目不忽略、路径 / 分隔、SHA256、符号链接拒绝', async () => {
         const dir = path.join(tmpRoot, 'enum-ws');
         await fs.mkdir(path.join(dir, 'sub'), { recursive: true });
         await fs.mkdir(path.join(dir, 'node_modules', 'dep'), { recursive: true });
         await fs.mkdir(path.join(dir, '.git'), { recursive: true });
+        await fs.mkdir(path.join(dir, 'sub', '.git'), { recursive: true });
+        await fs.mkdir(path.join(dir, 'sub', 'node_modules'), { recursive: true });
         await fs.writeFile(path.join(dir, 'sub', 'a.txt'), 'hello');
         await fs.writeFile(path.join(dir, 'node_modules', 'dep', 'index.js'), 'dep');
         await fs.writeFile(path.join(dir, '.git', 'HEAD'), 'ref');
+        await fs.writeFile(path.join(dir, 'sub', '.git', 'config'), 'nested-git');
+        await fs.writeFile(path.join(dir, 'sub', 'node_modules', 'nested.js'), 'nested');
         await fs.writeFile(path.join(dir, '.dacw-workspace'), '{}');
         await fs.writeFile(path.join(dir, 'root.txt'), 'r');
         const digest = await enumerateWorkspace(dir);
-        eq(Array.from(digest.keys()), ['root.txt', 'sub/a.txt']);
+        // F1：根级 .git/node_modules/.dacw-workspace 不进入文件摘要；子目录同名条目正常纳入
+        eq(Array.from(digest.keys()), ['root.txt', 'sub/.git/config', 'sub/a.txt', 'sub/node_modules/nested.js']);
         assert.equal(digest.get('sub/a.txt'), crypto.createHash('sha256').update('hello').digest('hex'));
         // 符号链接必须拒绝；Windows 非管理员可能无法创建链接（EPERM），此时跳过该断言
         let linked = false;
@@ -480,6 +485,26 @@ try {
             linked = true;
         } catch { /* 无权限创建符号链接：跳过 */ }
         if (linked) await rejects(() => enumerateWorkspace(dir));
+    });
+    await ta('fingerprintProtectedDirs：只对顶层条目做指纹（内容变化不影响，增删条目即变化）', async () => {
+        const dir = path.join(tmpRoot, 'fp-ws');
+        await fs.mkdir(path.join(dir, 'node_modules', 'dep'), { recursive: true });
+        await fs.mkdir(path.join(dir, '.git'), { recursive: true });
+        await fs.writeFile(path.join(dir, 'node_modules', 'dep', 'index.js'), 'dep', 'utf8');
+        await fs.writeFile(path.join(dir, '.git', 'HEAD'), 'ref', 'utf8');
+        const before = await fingerprintProtectedDirs(dir);
+        eq(Array.from(before.keys()), ['.git', 'node_modules']);
+        // 递归内容变化：顶层指纹不变
+        await fs.writeFile(path.join(dir, 'node_modules', 'dep', 'index.js'), 'dep2', 'utf8');
+        const same = await fingerprintProtectedDirs(dir);
+        eq(Array.from(same.entries()), Array.from(before.entries()));
+        // 顶层条目增删：指纹变化
+        await fs.writeFile(path.join(dir, 'node_modules', 'injected.js'), 'x', 'utf8');
+        const changed = await fingerprintProtectedDirs(dir);
+        assert.notEqual(changed.get('node_modules'), before.get('node_modules'));
+        // 目录缺失：不记录（缺失/新建由 diff 的 -/+ 表达）
+        const missing = await fingerprintProtectedDirs(path.join(tmpRoot, 'fp-missing'));
+        eq(Array.from(missing.keys()), []);
     });
 
     // ---- 隔离 fail-closed（E 组）：无法确认隔离即终止，绝不记为成功 ----
@@ -615,11 +640,12 @@ try {
         return binDir;
     };
 
-    const runReconWorkflow = async (tag, scriptBody) => {
+    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction) => {
         const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
         const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
         await fs.mkdir(wsDir, { recursive: true });
         await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }), 'utf8');
+        if (prepare) await prepare(wsDir);
         const prevPath = process.env.PATH;
         process.env.PATH = binDir + path.delimiter + path.dirname(process.execPath) + path.delimiter + (prevPath ?? '');
         try {
@@ -630,6 +656,7 @@ try {
                     if (agentId === 'reviewer-agent') {
                         reviewerCalled = true;
                         reviewerInput = contextText;
+                        if (reviewerAction) await reviewerAction(wsDir);
                         return '{"verdict":"PASS"}';
                     }
                     return JSON.stringify({ changed: [{ file: 'main.js', code: 'console.log(1);\n' }], deleted: [] });
@@ -672,6 +699,64 @@ try {
         assert.ok(result.files.includes('package.json'), JSON.stringify(result.files));
         assert.match(reviewerInput, /--- 文件: main\.js ---/);
         assert.match(reviewerInput, /--- 文件: package\.json ---/);
+    });
+
+    // ---- F 组：递归忽略绕过（F1）、根级受保护目录指纹（F2）、最终三边界一致性（F3） ----
+    await ta('F1：测试在 nested/node_modules 投放 payload.js → 检测为 + 新增、转人工、不进入审查', async () => {
+        const script = `const fs = require('node:fs');
+fs.mkdirSync('nested/node_modules', { recursive: true });
+fs.writeFileSync('nested/node_modules/payload.js', '// injected by test');
+`;
+        const { result, reviewerCalled } = await runReconWorkflow('f1-nested', script);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /nested\/node_modules\/payload\.js/);
+        assert.match(result.message, /\+ 新增/);
+        assert.equal(reviewerCalled, false);
+    });
+    await ta('F2：测试新增根级 node_modules 顶层条目 → 指纹变化、转人工、不进入审查', async () => {
+        const script = `const fs = require('node:fs');
+fs.writeFileSync('node_modules/injected.js', '// injected by test');
+`;
+        const prepare = async (wsDir) => {
+            await fs.mkdir(path.join(wsDir, 'node_modules', 'dep'), { recursive: true });
+            await fs.writeFile(path.join(wsDir, 'node_modules', 'dep', 'index.js'), 'dep', 'utf8');
+        };
+        const { result, reviewerCalled } = await runReconWorkflow('f2-mutation', script, prepare);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /受保护目录/);
+        assert.match(result.message, /node_modules/);
+        assert.equal(reviewerCalled, false);
+    });
+    await ta('F2：根级 node_modules/.git 正常存在且未被测试改动 → 不误报、正常进入审查', async () => {
+        const prepare = async (wsDir) => {
+            await fs.mkdir(path.join(wsDir, 'node_modules', 'dep'), { recursive: true });
+            await fs.writeFile(path.join(wsDir, 'node_modules', 'dep', 'index.js'), 'dep', 'utf8');
+            await fs.mkdir(path.join(wsDir, '.git'), { recursive: true });
+            await fs.writeFile(path.join(wsDir, '.git', 'HEAD'), 'ref', 'utf8');
+        };
+        const { result, reviewerCalled, reviewerInput } = await runReconWorkflow('f2-clean', 'process.exit(0);', prepare);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.deepEqual(
+            result.files.filter((file) => file === 'node_modules' || file.startsWith('node_modules/') || file === '.git' || file.startsWith('.git/')),
+            [],
+            JSON.stringify(result.files));
+        assert.ok(result.files.includes('main.js'), JSON.stringify(result.files));
+        assert.doesNotMatch(reviewerInput, /--- 文件: (node_modules|\.git)/);
+    });
+    await ta('F3：审查期间工作区被改动 → 三边界断言失败、success:false', async () => {
+        const reviewerAction = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, 'late-append.js'), '// written during review', 'utf8');
+        };
+        const { result, reviewerCalled } = await runReconWorkflow('f3-window', 'process.exit(0);', null, reviewerAction);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /最终一致性断言失败/);
+        assert.match(result.message, /审查期间工作区文件发生变动/);
+        assert.match(result.message, /late-append\.js/);
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {

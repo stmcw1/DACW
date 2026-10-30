@@ -44,7 +44,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 84 项回归自测
+node selftest.mjs                           # 89 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
