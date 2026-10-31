@@ -828,18 +828,29 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 continue;
             }
 
-            // 秘密扫描（默认开启）：命中仅记录审计（文件:类别，不记录原文）+ 日志告警；
-            // 命中处置规则（拒/打回）由后续步骤接入，本轮不阻断流程。
+            // 秘密扫描（默认开启）：命中 → 本轮拒绝（不落盘、不测试），feedback 只写「文件+类别」、
+            // 绝不回显密钥原文；随后 continue 进入下一轮让写手修正。
             if (options.secretScanEnabled) {
                 const secretHit = scanWriterOutputForSecrets(delta);
                 await stateManager.update((s) => {
                     s.secretScanHits = secretHit ? [`${secretHit.file}:${secretHit.category}`] : null;
                 });
                 if (secretHit) {
-                    logError(context, `[秘密扫描] 写手输出命中凭据模式：${secretHit.file}（${secretHit.category}）；已记录审计（不记录原文）。`);
+                    logError(context, `[秘密扫描] 写手输出命中凭据模式：${secretHit.file}（${secretHit.category}）；本轮已拒绝（不落盘、不测试、不记录原文）。`);
+                    await stateManager.update((s) => { s.lastError = `[秘密扫描] ${secretHit.file} 命中凭据类别 ${secretHit.category}，本轮已拒绝`; });
+                    feedback = `[系统警告] 上一轮输出被秘密扫描拒绝：文件 ${secretHit.file} 命中凭据类别「${secretHit.category}」。`
+                        + '请移除真实密钥/凭据（反馈与日志不会回显密钥原文），改用环境变量或占位符后，'
+                        + '按输出协议 v2 重新输出本轮变更。';
+                    await conversation.discardSinceCheckpoint();
+                    continue;
                 }
             } else {
-                await stateManager.update((s) => { s.secretScanHits = null; });
+                logError(context, '[安全降级] secretScanEnabled=false：写手输出秘密扫描已关闭，'
+                    + '密钥可能进入代码/审查上下文；请仅在完全可信的场景下使用。');
+                await stateManager.update((s) => {
+                    s.secretScanHits = null;
+                    s.lastError = '[安全降级] secretScanEnabled=false：本次运行未做写手输出秘密扫描';
+                });
             }
 
             try {

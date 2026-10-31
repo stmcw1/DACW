@@ -717,6 +717,7 @@ try {
             const logs = [];
             let reviewerCalled = false;
             let reviewerInput = '';
+            const writerContexts = [];
             const context = {
                 chat: async (agentId, _prompt, contextText) => {
                     if (agentId === 'reviewer-agent') {
@@ -725,6 +726,8 @@ try {
                         if (reviewerAction) await reviewerAction(wsDir);
                         return '{"verdict":"PASS"}';
                     }
+                    // feedback 由引擎写入写手 system prompt（_prompt），user context 通常为空。
+                    writerContexts.push(`${_prompt}\n${contextText}`);
                     const changed = writerChanged ?? [{ file: 'main.js', code: 'console.log(1);\n' }];
                     return JSON.stringify({ changed, deleted: [] });
                 },
@@ -740,7 +743,7 @@ try {
                 ...(extraOptions ?? {}),
             });
             const result = await execute(`selftest-recon-${tag}`, wsDir, 'task');
-            return { result, reviewerCalled, reviewerInput, logs };
+            return { result, reviewerCalled, reviewerInput, logs, writerContexts };
         } finally {
             process.env.PATH = prevPath;
         }
@@ -1013,24 +1016,70 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
         eq(persisted.reviewExcluded, ['z-secret.pem']);
     });
-    await ta('秘密扫描审计：命中写入状态 secretScanHits（文件:类别，不含原文）', async () => {
-        const secretCode = 'const k = "AKIAABCDEFGHIJKLMNOP";\n';
-        const { result, logs } = await runReconWorkflow(
-            'secret-audit',
+    await ta('秘密扫描：命中 → 本轮拒绝、feedback 含文件+类别不含原文、状态留痕', async () => {
+        const apiKey = 'sk-' + 'a'.repeat(40);
+        const { result, reviewerCalled, logs, writerContexts } = await runReconWorkflow(
+            'secret-reject',
+            'process.exit(0);',
+            null,
+            null,
+            { maxRounds: 2 },
+            undefined,
+            [{ file: 'main.js', code: `const k = "${apiKey}";\n` }]);
+        assert.equal(reviewerCalled, false, '命中轮次不应进入测试/审查');
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.ok(logs.some((line) => line.includes('[秘密扫描]')), JSON.stringify(logs));
+        // 第二轮写手上下文应包含 feedback（文件 + 类别），且不含密钥原文
+        assert.ok(writerContexts.length >= 2, JSON.stringify(writerContexts.length));
+        const feedbackContext = writerContexts[1];
+        assert.match(feedbackContext, /main\.js/);
+        assert.match(feedbackContext, /OpenAI Key/);
+        assert.ok(!feedbackContext.includes(apiKey), 'feedback 不得回显密钥原文');
+        const stateDir = path.join(tmpRoot, 'state-recon-secret-reject');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const rawState = await fs.readFile(path.join(stateDir, stateName), 'utf8');
+        const persisted = JSON.parse(rawState);
+        eq(persisted.secretScanHits, ['main.js:OpenAI Key']);
+        assert.ok(!rawState.includes(apiKey), '状态文件不得记录密钥原文');
+    });
+    await ta('秘密扫描：sk-learn 等普通字符串不误报，正常通过', async () => {
+        const { result, reviewerCalled } = await runReconWorkflow(
+            'secret-no-false-positive',
             'process.exit(0);',
             null,
             null,
             undefined,
             undefined,
-            [{ file: 'main.js', code: secretCode }]);
-        assert.equal(result.status, 'NEED_HUMAN');
-        assert.ok(logs.some((line) => line.includes('[秘密扫描]')), JSON.stringify(logs));
-        const stateDir = path.join(tmpRoot, 'state-recon-secret-audit');
+            [{ file: 'main.js', code: 'const s = "sk-learn";\n' }]);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        const stateDir = path.join(tmpRoot, 'state-recon-secret-no-false-positive');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.secretScanHits, null);
+    });
+    await ta('秘密扫描关闭：写 key 也通过，但日志【安全降级】+ 状态 lastError 留痕', async () => {
+        const apiKey = 'sk-' + 'b'.repeat(40);
+        const { result, reviewerCalled, logs } = await runReconWorkflow(
+            'secret-scan-disabled',
+            'process.exit(0);',
+            null,
+            null,
+            { secretScanEnabled: false },
+            undefined,
+            [{ file: 'main.js', code: `const k = "${apiKey}";\n` }]);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.ok(logs.some((line) => line.includes('安全降级') && line.includes('secretScanEnabled=false')),
+            JSON.stringify(logs));
+        const stateDir = path.join(tmpRoot, 'state-recon-secret-scan-disabled');
         const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
         const rawState = await fs.readFile(path.join(stateDir, stateName), 'utf8');
         const persisted = JSON.parse(rawState);
-        eq(persisted.secretScanHits, ['main.js:AWS Access Key']);
-        assert.ok(!rawState.includes('AKIAABCDEFGHIJKLMNOP'), '状态文件不得记录密钥原文');
+        assert.match(String(persisted.lastError), /secretScanEnabled=false/);
+        eq(persisted.secretScanHits, null);
+        assert.ok(!rawState.includes(apiKey), '状态文件不得记录密钥原文');
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
