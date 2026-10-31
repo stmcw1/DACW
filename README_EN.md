@@ -47,7 +47,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 100 regression vectors
+node selftest.mjs                           # 101 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 

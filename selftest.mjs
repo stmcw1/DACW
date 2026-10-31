@@ -924,6 +924,31 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.match(result.message, /敏感文件未送模型审查/);
         assert.match(result.message, /\.env/);
         assert.ok(logs.some((line) => line.includes('[审查排除]')), JSON.stringify(logs));
+        // 审计可追溯：状态文件记录本轮被排除的敏感文件
+        const stateDir = path.join(tmpRoot, 'state-recon-sensitive-excluded');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.reviewExcluded, ['.env']);
+    });
+    await ta('零送审：全部文件被敏感排除 → success:false、转人工、message 明确', async () => {
+        // 删除 package.json 以构造"工作区只有敏感文件"的零送审场景（否则 package.json 会被正常送审）。
+        const prepare = async (wsDir) => { await fs.rm(path.join(wsDir, 'package.json'), { force: true }); };
+        const { result, reviewerCalled } = await runReconWorkflow(
+            'sensitive-zero',
+            'process.exit(0);',
+            prepare,
+            null,
+            undefined,
+            undefined,
+            [{ file: '.env', code: 'SECRET=1\n' }]);
+        assert.equal(reviewerCalled, false, '零送审不应调用审查者');
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /本次无任何文件送模型审查，全部需人工确认/);
+        const stateDir = path.join(tmpRoot, 'state-recon-sensitive-zero');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.reviewExcluded, ['.env']);
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {

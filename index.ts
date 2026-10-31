@@ -1034,6 +1034,22 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, `审查前文件完整性校验失败，需人工介入：${readErrorMsg}`, round);
             }
 
+            // 审计可追溯：审查阶段结束时把"因敏感被排除、未送模型审查"的文件清单写入状态。
+            const excludedForAudit = Array.from(reviewExcluded).sort();
+            await stateManager.update((s) => {
+                s.reviewExcluded = excludedForAudit.length > 0 ? excludedForAudit : null;
+            });
+
+            // 零送审 fail-closed：没有任何文件送入模型审查（全部被敏感排除）→ 不放行 success:true。
+            // 不依赖 allowTruncatedReview（该逃生门只覆盖截断/摘要，不覆盖"零语义审查"）。
+            if (iteratedKeys.length === 0 && reviewExcluded.size > 0) {
+                const message = `本次无任何文件送模型审查，全部需人工确认（${excludedForAudit.length} 个敏感文件被排除：`
+                    + `${excludedForAudit.slice(0, 20).join(', ')}${excludedForAudit.length > 20 ? ' …' : ''}）。已拒绝 success:true。`;
+                await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = message; });
+                logError(context, message);
+                return finish(false, message, round);
+            }
+
             const reviewOutcome = await safeChat(
                 context, 'reviewer-agent', REVIEWER_PROMPT,
                 `任务需求如下：\n${taskPrompt}\n\n本次工作区的所有代码文件如下：\n${actualCodes}`,
