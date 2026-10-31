@@ -950,6 +950,32 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
         eq(persisted.reviewExcluded, ['.env']);
     });
+    await ta('截断 + 逃生门：截断点后的敏感文件不得被标成「未送审（审查输入上限）」', async () => {
+        // 排序：a-large.js（触发总输入上限）< package.json < z-secret.pem（敏感，位于截断点之后）。
+        const { result, logs } = await runReconWorkflow(
+            'truncated-sensitive',
+            'process.exit(0);',
+            null,
+            null,
+            { reviewInputMaxChars: 100, allowTruncatedReview: true },
+            undefined,
+            [
+                { file: 'a-large.js', code: 'x'.repeat(500) },
+                { file: 'z-secret.pem', code: 'PRIVATE-KEY-MATERIAL\n' },
+            ]);
+        assert.equal(result.success, true);   // 逃生门开启：截断可放行
+        assert.ok(result.files.includes('z-secret.pem'), JSON.stringify(result.files));
+        assert.equal(
+            result.files.some((file) => file.startsWith('z-secret.pem（')),
+            false, '敏感文件不应被标注为截断/未送审：' + JSON.stringify(result.files));
+        assert.match(result.message, /敏感文件未送模型审查/);
+        assert.match(result.message, /z-secret\.pem/);
+        assert.ok(logs.some((line) => line.includes('[安全降级]')), JSON.stringify(logs));
+        const stateDir = path.join(tmpRoot, 'state-recon-truncated-sensitive');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.reviewExcluded, ['z-secret.pem']);
+    });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
         const logs = [];

@@ -980,7 +980,13 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                         if (!appendReviewFile(relDisplay, code)) {
                             // G1：总输入上限截断——记录当前文件与其余未送审文件（fail-closed 明细）。
                             truncatedFiles.push(`${relDisplay}（受总输入上限 ${options.reviewInputMaxChars} 字符限制，未能完整送审）`);
-                            unreviewedFiles.push(...reviewKeys.slice(i + 1).map((key) => key.split(path.sep).join('/')));
+                            const remainingKeys = reviewKeys.slice(i + 1).map((key) => key.split(path.sep).join('/'));
+                            // 敏感文件不会因截断改变"不送审"的原因（敏感排除）；补记到 reviewExcluded，
+                            // 且不进入 "未送审（审查输入上限）" 清单，避免 allowTruncatedReview 放行时标注错因。
+                            for (const key of remainingKeys) {
+                                if (isSensitiveReviewFile(key)) reviewExcluded.add(key);
+                            }
+                            unreviewedFiles.push(...remainingKeys.filter((key) => !isSensitiveReviewFile(key)));
                             break;
                         }
                         reviewed.add(relDisplay);
