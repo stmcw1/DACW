@@ -6,14 +6,16 @@
  * 因此审查是【侦探性控制】，绝不是执行前的安全屏障。子代理工具隔离只约束子代理
  * 能否调用宿主工具，同样不能约束测试进程本身。唯一有效的预防性控制是隔离执行：
  *
- *   - mode 'auto'（默认，沙盒开启）：Docker 可用 → 一次性容器执行（见下）；不可用时
- *     系统不会崩溃、也不会静默降级，而是弹出「是否关闭沙盒」的人类确认（consent 流程）：
+ *   - mode 'host'（默认，主线）：执行隔离默认关闭——测试以宿主用户全权限运行写手产出的
+ *     任意代码（命令白名单只防命令注入，不构成隔离）。
+ *   - mode 'auto'（显式配置才生效）：Docker 可用 → 一次性容器执行（见下）；不可用时
+ *     不崩溃、不静默降级，而是弹出「是否关闭沙盒」的人类确认（consent 流程）：
  *     用户确认关闭才改为宿主直执并标注安全降级；选择保持或无法确认则 fail-closed 停止。
- *   - mode 'docker'：强制一次性容器执行（无网络、只读根文件系统、非 root/uid 1000、
+ *   - mode 'docker'（显式配置）：强制一次性容器执行（无网络、只读根文件系统、非 root/uid 1000、
  *     cap-drop ALL、no-new-privileges、内存/CPU/进程数上限；工作区复制到一次性暂存目录
- *     再挂载，宿主工作区本身不进入容器）；Docker 不可用同样进入上述确认流程。
- *   - mode 'host'：显式宿主直执（无隔离）——用户显式接受风险；测试以宿主用户全权限
- *     运行写手产出的任意代码。
+ *     再挂载，宿主工作区本身不进入容器）；Docker 不可用时拒绝运行（不询问、不降级）。
+ *
+ * [分叉点] temp-sandbox 线默认 auto + 交互同意；mvp-1 线默认 host。合并时注意默认值冲突。
  *
  * [边界] Docker 容器不是完美隔离：它共享宿主内核，镜像本身必须可信（仅使用
  * 官方镜像或经过审查的镜像），Docker Desktop 的文件共享层也有自身攻击面。
@@ -32,9 +34,9 @@ export type SandboxMode = (typeof SANDBOX_MODES)[number];
 
 export interface SandboxConfig {
     /**
-     * auto（默认，沙盒开启）：Docker 可用则容器化；不可用时不崩溃、不静默降级，
-     * 而是弹出确认询问是否关闭沙盒（见 index.ts 的 consent 流程）。
-     * docker：强制容器（不可用时同样进入确认流程）；host：显式宿主直执（无隔离）。
+     * host（默认，主线）：执行隔离默认关闭，测试在宿主用户权限下运行；
+     * auto（显式配置）：Docker 可用则容器化，不可用时交互询问是否降级；
+     * docker（显式配置）：强制容器，不可用时拒绝运行（不询问、不降级）。
      */
     mode: SandboxMode;
     /** 容器镜像；空串表示按测试命令自动选择官方镜像。 */
@@ -48,7 +50,7 @@ export interface SandboxConfig {
 }
 
 export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
-    mode: 'auto',
+    mode: 'host',
     image: '',
     memoryMb: 1024,
     cpus: 1,
@@ -317,9 +319,10 @@ export function detectDocker(timeoutMs = 4000): Promise<{ ok: true; version: str
 
 /**
  * 解析本次调用的执行策略：
- *   - host → 直接宿主执行（仅显式配置；用户已接受无隔离风险）；
- *   - auto（默认）/ docker → Docker 可用则容器化；不可用返回 blocked——不崩溃、不静默降级，
- *     由调用方发起「是否关闭沙盒」的人类确认；拒绝或无法确认则 fail-closed 停止。
+ *   - host（默认）→ 直接宿主执行（执行隔离默认关闭；用户已接受无隔离风险）；
+ *   - auto → Docker 可用则容器化；不可用返回 blocked——由调用方发起「是否关闭沙盒」的人类确认，
+ *     拒绝或无法确认则 fail-closed 停止；
+ *   - docker → Docker 不可用返回 blocked（调用方直接拒绝运行，不询问、不降级）。
  * `detect` 可注入（回归测试 / 宿主自定义探测），默认 detectDocker。
  */
 export async function resolveExecutionPolicy(

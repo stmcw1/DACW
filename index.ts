@@ -697,11 +697,12 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     try {
         await stateManager.init(taskPrompt);
 
-        // 测试执行策略只解析一次（探测 docker 守护进程）。沙盒不可用时不崩溃、不静默降级：
-        // 先通过宿主交互 seam（ctx.userQuestions）弹出「是否关闭沙盒」确认；拒绝/无法确认则 fail-closed 停止。
+        // 测试执行策略只解析一次（默认 host 不探测 Docker；仅显式 auto/docker 才探测）。
+        // auto：Docker 不可用时通过宿主交互 seam（ctx.userQuestions）询问是否关闭沙盒；
+        // docker：显式要求容器，不可用时直接拒绝运行（不询问、不降级）。
         sandboxPlan = await resolveExecutionPolicy(options.sandbox, options.sandboxDetect ?? detectDocker);
         logSystem(context, `🛡️ 测试执行策略：${describePolicy(sandboxPlan)}`);
-        if (sandboxPlan.kind === 'blocked') {
+        if (sandboxPlan.kind === 'blocked' && sandboxPlan.mode === 'auto') {
             const consentRequest = buildSandboxConsentRequest(sandboxPlan);
             logError(context, `[沙盒] ${consentRequest.message}\n${consentRequest.detail}`);
             let consent: SandboxConsentResult;
@@ -727,6 +728,14 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 logError(context, message);
                 return finish(false, message, 0);
             }
+        } else if (sandboxPlan.kind === 'blocked') {
+            // docker（显式要求容器）：不可用时直接拒绝，不进入交互询问、不降级。
+            const message = `sandbox.mode="docker" 要求容器执行，但 Docker 不可用：${sandboxPlan.reason}。`
+                + '已拒绝运行，未在宿主执行任何测试代码（不询问、不静默降级）。'
+                + '请安装/启动 Docker 后重试；或显式设置 sandbox.mode: "auto"（不可用时交互确认）或 "host"（接受宿主执行风险）。';
+            await stateManager.update((s) => { s.status = 'NEED_HUMAN'; s.lastError = 'docker 模式不可用，测试未执行'; });
+            logError(context, message);
+            return finish(false, message, 0);
         }
         runner = new Runner(workspaceDir, sandboxPlan);
         if (sandboxPlan.kind === 'host' && !sandboxDisabledByConsent && options.sandboxExplicit) {

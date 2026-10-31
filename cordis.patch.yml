@@ -12,9 +12,9 @@
         workspacePolicy: guarded
         maxRounds: 3
         subagentProvider: spawn
-        # 测试执行策略（默认 auto：沙盒开启；Docker 不可用时弹出人类确认，保持/无法确认则 fail-closed，绝不静默降级）
+        # 测试执行策略（默认 host：执行隔离默认关闭，测试在宿主用户权限下运行）
         # sandbox:
-        #   mode: auto          # auto（默认）| docker | host（显式 host 无隔离、不询问、有红色警告）
+        #   mode: host          # host（默认，执行隔离关闭）| auto（显式；Docker 可用则容器化，不可用则交互确认）| docker（强制容器，不可用拒绝运行）
         #   image: ''           # 空 = 按测试命令自动选择官方镜像；也可固定如 node:22-bookworm-slim
         #   memoryMb: 1024
         #   cpus: 1

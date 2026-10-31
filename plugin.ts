@@ -870,10 +870,10 @@ function renderToolResultText(value: any): string {
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
     '独立审查者子代理审计全量文件并给出 JSON 裁决 → 通过后停在人工闸门（NEED_HUMAN），绝不自动合入。' +
-    '测试在任何审查之前执行；默认开启沙盒（sandbox.mode:"auto"）：Docker 可用时在一次性容器内跑测试' +
-    '（无网络、只读根文件系统、非 root、资源受限）；检测到无 Docker/沙盒不可用时不崩溃、不静默降级，' +
-    '而是通过 ctx.userQuestions 弹出「是否关闭沙盒」确认——确认关闭后才以宿主权限执行并标注安全降级，' +
-    '选择保持或无法交互则 fail-closed 停止。审查者审计是侦探性控制，不是执行前屏障。' +
+    '测试在任何审查之前执行；默认 host（执行隔离默认关闭，测试以宿主用户权限运行写手产出的代码）。' +
+    '如需容器隔离可显式配置 sandbox.mode:"auto"：Docker 可用时在一次性容器内跑测试（无网络、只读根文件系统、' +
+    '非 root、资源受限）；Docker 不可用时通过 ctx.userQuestions 交互询问是否降级，拒绝或无法确认即 fail-closed 停止；' +
+    'sandbox.mode:"docker" 强制容器，不可用时拒绝运行。审查者审计是侦探性控制，不是执行前屏障。' +
     '当需要"让模型写代码、让真实测试验证、让独立审查者把关、最后人工确认"时使用本工具。' +
     '注意：DACW 每轮都会把工作区内容重置为产出文件集（仅保留 package.json 等地基文件与 .git/node_modules），' +
     '因此必须指向专用空目录（工具会写入 .dacw-workspace 标记）；不要在存放重要文件的目录上运行。' +

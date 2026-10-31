@@ -195,9 +195,9 @@ t('插件配置：工具隔离默认开启，仅显式 false 关闭', () => {
 });
 
 // ================= 沙箱策略：测试执行位置（安全边界核心） =================
-t('沙箱配置：缺省用默认值（auto，沙盒开启）', () => {
+t('沙箱配置：缺省用默认值（host，执行隔离默认关闭）', () => {
     eq(normalizeSandboxConfig(null, [], 'x'), DEFAULT_SANDBOX_CONFIG);
-    assert.equal(DEFAULT_SANDBOX_CONFIG.mode, 'auto');
+    assert.equal(DEFAULT_SANDBOX_CONFIG.mode, 'host');
 });
 t('沙箱配置：非法 mode / 数值回退并逐项告警', () => {
     const warnings = [];
@@ -275,10 +275,10 @@ t('沙盒确认：请求文案（检测内容输出）与回答解析（只有�
     eq(parseSandboxConsentAnswer({ answers: [{ id: 'dacw-sandbox-consent', selected: ['某个未知选项'] }] }, request), { decision: 'keep_sandbox' });
     eq(parseSandboxConsentAnswer({ answers: [] }, request), { decision: 'keep_sandbox' });
 });
-t('插件配置：sandbox 默认 auto（不告警）；显式 host 才告警并标记 explicit', () => {
+t('插件配置：sandbox 默认 host（不告警）；显式 host 才告警并标记 explicit', () => {
     // workspacePolicy 显式给出，避免触发既有的"缺省 workspacePolicy"告警，隔离本用例的断言面
     const defaults = normalizePluginConfig({ workspacePolicy: 'guarded' });
-    assert.equal(defaults.config.sandbox.mode, 'auto');
+    assert.equal(defaults.config.sandbox.mode, 'host');
     assert.equal(defaults.sandboxExplicit, false);
     assert.equal(defaults.warnings.length, 0, JSON.stringify(defaults.warnings));  // 默认值不告警
     const explicit = normalizePluginConfig({ sandbox: { mode: 'host' } });
@@ -870,6 +870,30 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.match(result.message, /未关闭沙盒/);
         assert.match(result.message, /交互确认能力/);
     });
+    await ta('docker 模式不可用：直接拒绝运行，不弹确认、不降级', async () => {
+        let asked = false;
+        const askUserQuestion = async () => { asked = true; return { decision: 'disable_sandbox' }; };
+        const { result, reviewerCalled } = await runReconWorkflow('sandbox-docker', 'process.exit(0);', null, null, {
+            sandbox: { mode: 'docker' },
+            sandboxDetect: failingDetect,
+        }, askUserQuestion);
+        assert.equal(asked, false);
+        assert.equal(reviewerCalled, false);
+        assert.equal(result.success, false);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.match(result.message, /sandbox\.mode="docker" 要求容器执行/);
+        assert.match(result.message, /不询问/);
+    });
+    await ta('默认 host：不探测 Docker、不弹确认，正常执行', async () => {
+        let detected = false;
+        let asked = false;
+        const { result } = await runReconWorkflow('sandbox-defaulthost', 'process.exit(0);', null, null, {
+            sandboxDetect: async () => { detected = true; return { ok: false, reason: '默认 host 不应探测 Docker' }; },
+        }, async () => { asked = true; return { decision: 'keep_sandbox' }; });
+        assert.equal(detected, false);
+        assert.equal(asked, false);
+        assert.equal(result.success, true);
+    });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
         const logs = [];
@@ -888,7 +912,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             `日志里没有模型配置行：${JSON.stringify(logs)}`,
         );
     });
-    await ta('引擎审计日志：默认 auto 沙盒策略；显式 host 出现红色警告', async () => {
+    await ta('引擎审计日志：默认 host 策略；显式 auto 走容器；显式 host 出现红色警告', async () => {
         const runEngine = async (options, tag) => {
             const logs = [];
             const context = { chat: async () => '不是 JSON', log: (message) => logs.push(message) };
@@ -903,10 +927,12 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         };
         const defaultLogs = await runEngine({}, 'default');
         assert.ok(defaultLogs.some((line) => line.includes('测试执行策略')), JSON.stringify(defaultLogs));
-        assert.ok(defaultLogs.some((line) => line.includes('一次性 Docker 容器')), `缺默认沙盒策略提示：${JSON.stringify(defaultLogs)}`);
+        assert.ok(defaultLogs.some((line) => line.includes('宿主直接执行（无隔离）')), `缺默认 host 策略提示：${JSON.stringify(defaultLogs)}`);
         assert.equal(
             defaultLogs.some((line) => line.includes('你显式配置了 sandbox.mode="host"')),
             false, '默认值不应出现红色 host 警告');
+        const autoLogs = await runEngine({ sandbox: { mode: 'auto' } }, 'auto');
+        assert.ok(autoLogs.some((line) => line.includes('一次性 Docker 容器')), `缺 auto 容器策略提示：${JSON.stringify(autoLogs)}`);
         const explicitLogs = await runEngine({ sandbox: { mode: 'host' }, sandboxExplicit: true }, 'explicit');
         assert.ok(
             explicitLogs.some((line) => line.includes('你显式配置了 sandbox.mode="host"')),

@@ -14,7 +14,7 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 
 - **Separation of powers**: the writer only emits a JSON changeset, the runner only executes whitelisted commands, the reviewer only emits a verdict — no single party can merge code.
 - **Zero-tool child isolation**: writer/reviewer run on persona-only presets; on `agent/created` the plugin uses `ctx.tools.restrict({ allow: [] })` to strip every inherited tool and verifies the child sees zero tools. If isolation fails, the child is never created.
-- **Sandbox on by default (auto)**: `sandbox.mode` defaults to `"auto"` — when Docker is available tests run in a one-shot container (no network, read-only root filesystem, non-root, cap-drop ALL, resource-limited). When Docker/sandbox is unavailable DACW **neither crashes nor silently degrades**: it shows a human confirmation ("disable sandbox?"); keeping the sandbox or being unable to ask fails closed, and only an explicit disable runs on the host (flagged as a security downgrade in the result).
+- **Execution isolation off by default (host)**: `sandbox.mode` defaults to `"host"` — tests run writer-produced code with host-user privileges (no container isolation). Set `"auto"` explicitly to containerize when Docker is available and to get an interactive confirmation when it is not (keeping the sandbox or being unable to ask fails closed).
 - **Output protocol v2**: the writer emits only deltas against the baseline, untouched files are preserved byte-for-byte, which cuts tokens and prevents "the code that passed last round got broken" regressions.
 - **Deterministic runner**: command whitelist (npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go), environment whitelist, timeout tree-kill, output truncation.
 - **Structured review**: the verdict must be exact JSON; unparseable output is treated as REJECTED; PASS containing suspicious wording goes to the human gate.
@@ -46,7 +46,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 96 regression vectors
+node selftest.mjs                           # 98 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -84,24 +84,24 @@ On workflow failure the tool throws (including workspace, status, round and log 
 
 ## Sandbox configuration
 
-`config.sandbox` decides where tests execute (**`auto` by default — sandbox on**). When Docker is unavailable DACW **neither crashes nor silently degrades** to host execution; it asks the human through the DSH interaction seam:
+`config.sandbox` decides where tests execute (**`host` by default — execution isolation off, tests run with host-user privileges**).
 
-> No usable sandboxed isolation environment was detected (e.g. Docker is not installed or not running). Disable sandbox mode and continue?
+- For stronger isolation, explicitly set `sandbox.mode: "auto"`: Docker available → one-shot container (no network, read-only root filesystem, non-root, cap-drop ALL, resource-limited); Docker unavailable → interactive confirmation asking whether to downgrade — "keep sandbox" or no answer fails closed (never a silent downgrade).
+- Explicit `sandbox.mode: "docker"`: force a container; when Docker is unavailable the run is refused (no prompt, no downgrade).
+- Explicit `mode: "host"` produces a red startup warning (the default value does not warn).
 
-- "Keep sandbox" → the run is cancelled (fail-closed, no test code executes on the host);
-- "Disable sandbox and continue" → this run executes on the host user's privileges, flagged as **[security downgrade]** in the result;
-- Host cannot show the confirmation (no interaction capability) → the run is refused too.
+> Confirmation text (only for `auto` when Docker is unavailable): No usable sandboxed isolation environment was detected (e.g. Docker is not installed or not running). Disable sandbox mode and continue?
 
 | Mode | Behavior |
 |---|---|
-| `auto` (default) | Docker available → one-shot container; unavailable → human confirmation (above); keep/unavailable → fail-closed |
-| `docker` | Force a one-shot container; unavailable → same confirmation flow |
-| `host` | Explicit host execution (no isolation, no prompt; red startup warning; use only when you fully trust the environment) |
+| `host` (default) | Run on the host (no isolation): execution isolation is off, tests run with host-user privileges |
+| `auto` | Docker available → one-shot container; unavailable → human confirmation; keep/unavailable → fail-closed |
+| `docker` | Force a one-shot container; Docker unavailable → run refused (no prompt, no downgrade) |
 
 ```yaml
 config:
   sandbox:
-    mode: auto                # auto (default) | docker | host
+    mode: host                # host (default) | auto | docker
     image: ''                 # empty = pick an official image per test command; or pin e.g. node:22-bookworm-slim
     memoryMb: 1024
     cpus: 1                   # fractions allowed
@@ -132,12 +132,12 @@ Resolution happens at the start of every tool call, so DSH settings changes appl
 
 ## Safety
 
-Sandbox is on by default: when Docker is available tests run in a one-shot container; when the sandbox is unavailable DACW asks the human, and keeping it or being unable to ask fails closed (it never silently degrades to host execution).
+Execution isolation is off by default: tests run with host-user privileges; setting `sandbox.mode: "auto"` explicitly containerizes when Docker is available and asks the human when it is not (keeping the sandbox or being unable to ask fails closed).
 
 DACW executes model-generated code and commands. **Tests execute before any review**, so review (including the human gate) is a detective control, not a pre-execution security barrier; child tool isolation is not a code-execution security boundary.
 
-- Default `sandbox.mode: "auto"`: tests run in a one-shot container by default; when Docker is unavailable DACW asks the human and refuses to run without confirmation — no silent degradation to host execution.
-- When the user explicitly disables the sandbox (or sets `sandbox.mode: "host"`), arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user, flagged as a **[security downgrade]** / red warning; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
+- Default `sandbox.mode: "host"`: execution isolation is off, tests run with host-user privileges; setting `"auto"` containerizes when Docker is available and asks the human when it is not (keeping it or being unable to ask fails closed, never a silent downgrade).
+- When the user explicitly confirms a downgrade (`auto` with the sandbox disabled) or sets `sandbox.mode: "host"`, arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user, flagged as a **[security downgrade]** / red warning; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
 - Review completeness is fail-closed by default: truncated review input or a lockfile sent only as a digest makes `success` false and routes to the human gate; `allowTruncatedReview: true` explicitly lets it pass (**lowers the security guarantee**; message/files/logs are flagged).
 - Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
 
@@ -149,7 +149,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 |---|---|
 | `plugin.ts` | DSH Host half: tool registration, child presets, runtime tool isolation, model resolution, workspace gate |
 | `index.ts` | Orchestrator: rounds, baseline merge, runner dispatch, verdict, human gate |
-| `sandbox.ts` | Sandbox policy: auto (default)/docker/host decision, container args, Docker detection, sandbox consent request |
+| `sandbox.ts` | Sandbox policy: host (default)/auto/docker decision, container args, Docker detection, auto-downgrade consent request |
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
 | `state_manager.ts` | State: atomic writes, HMAC, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |

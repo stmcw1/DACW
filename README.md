@@ -14,7 +14,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 - **三权分立**：写手只产出 JSON 变更集，运行机只执行白名单命令，审查者只输出裁决——没有任何一方能独立合入代码。
 - **子代理零工具隔离**：写手/审查者运行在 persona-only preset 上，插件在 `agent/created` 阶段用 `ctx.tools.restrict({ allow: [] })` 剥除全部继承工具并校验可见工具为 0；隔离失败则拒绝创建子代理。
-- **沙盒默认开启（auto）**：`sandbox.mode` 默认 `"auto"`——Docker 可用时在一次性容器内执行（无网络、只读根文件系统、非 root、cap-drop ALL、资源受限）；检测到无 Docker/沙盒不可用时**不崩溃、不静默降级**，而是弹出「是否关闭沙盒」确认：选择保持或无法交互则 fail-closed 停止，确认关闭才以宿主权限执行并在结果中标注安全降级。
+- **执行隔离默认关闭（host）**：`sandbox.mode` 默认 `"host"`——测试在宿主用户权限下运行写手产出的代码（无容器隔离）。可显式配置 `"auto"`：Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止）。
 - **输出协议 v2**：写手只输出相对基线的变更，未提及文件逐字节保留，明显减少 token，并避免"上轮通过的代码被改坏"。
 - **确定性运行机**：命令白名单（npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go）、环境变量白名单、超时强杀、输出截断。
 - **结构化审查**：裁决必须为精确 JSON，解析失败按 REJECTED 处理；PASS 但含可疑字样 → 人工闸门。
@@ -46,7 +46,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 96 项回归自测
+node selftest.mjs                           # 98 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
@@ -84,24 +84,24 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 
 ## 沙箱配置
 
-测试执行位置由 `config.sandbox` 决定（**默认 `auto`，沙盒开启**）。Docker 不可用时系统**不会崩溃、也不会静默降级**为宿主执行，而是通过 DSH 交互确认弹出：
+测试执行位置由 `config.sandbox` 决定（**默认 `host`：执行隔离默认关闭，测试在宿主用户权限下运行**）。
 
-> 未检测到可用的沙盒隔离环境（如 Docker 未安装或未启动）。是否关闭沙盒模式并继续？
+- 需要更强隔离时，可显式配置 `sandbox.mode: "auto"`：Docker 可用时在一次性容器内执行（无网络、只读根文件系统、非 root、cap-drop ALL、资源受限）；Docker 不可用时通过 DSH 交互确认询问是否降级——选择保持或无法确认即 fail-closed 停止（不会静默降级）。
+- 显式 `sandbox.mode: "docker"`：强制容器，Docker 不可用时拒绝运行（不询问、不降级）。
+- 显式 `mode: "host"` 时启动会有一条红色警告（默认值不告警）。
 
-- 选择「保持沙盒」→ 取消本次运行（fail-closed，不在宿主执行任何测试代码）；
-- 选择「关闭沙盒并继续」→ 本次以宿主用户权限执行，结果标注【安全降级】；
-- 宿主无法弹出确认（无交互能力）→ 同样拒绝运行。
+> 交互确认文案（仅 `auto` 且 Docker 不可用时触发）：未检测到可用的沙盒隔离环境（如 Docker 未安装或未启动）。是否关闭沙盒模式并继续？
 
 | 模式 | 行为 |
 |---|---|
-| `auto`（默认） | Docker 可用 → 一次性容器；不可用 → 弹出确认（见上），拒绝或无法确认则 fail-closed |
-| `docker` | 强制一次性容器；Docker 不可用同样进入确认流程 |
-| `host` | 显式宿主直执（无隔离，不询问；启动有红色警告，仅在你完全信任环境时使用） |
+| `host`（默认） | 宿主直执（无隔离）：执行隔离默认关闭，测试在宿主用户权限下运行 |
+| `auto` | Docker 可用 → 一次性容器；不可用 → 弹出确认，拒绝或无法确认则 fail-closed |
+| `docker` | 强制一次性容器；Docker 不可用 → 直接拒绝运行（不询问、不降级） |
 
 ```yaml
 config:
   sandbox:
-    mode: auto                # auto（默认）| docker | host
+    mode: host                # host（默认）| auto | docker
     image: ''                 # 空 = 按测试命令自动选择官方镜像；也可固定如 node:22-bookworm-slim
     memoryMb: 1024
     cpus: 1                   # 允许小数
@@ -132,12 +132,12 @@ config:
 
 ## 安全
 
-默认开启沙盒：Docker 可用时测试在一次性容器内执行；沙盒不可用时会弹出人类确认，选择保持或无法确认即 fail-closed 停止（不会静默降级为宿主执行）。
+执行隔离默认关闭：测试在宿主用户权限下运行；可显式启用 `sandbox.mode: "auto"` 在 Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止）。
 
 DACW 会执行模型生成的代码与命令。**测试在审查之前执行**，审查（含人工终审）是侦探性控制，不是执行前的安全屏障；子代理工具隔离不是代码执行的安全边界。
 
-- 默认 `sandbox.mode: "auto"`：测试默认在一次性容器内执行；Docker 不可用时弹出人类确认，不确认则拒绝运行——不会静默降级为宿主执行。
-- 用户显式确认关闭沙盒（或配置 `sandbox.mode: "host"`）时，写手产出的任意代码（含 `package.json` 的 test/pretest 脚本）将以宿主用户全权限运行，结果标注【安全降级】/红色警告；docker 模式也不是完美隔离（共享宿主内核、镜像需可信）。
+- 默认 `sandbox.mode: "host"`：执行隔离默认关闭，测试在宿主用户权限下运行；可显式配置 `"auto"` 在 Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止，不会静默降级）。
+- 用户显式确认降级（`auto` 下选择关闭沙盒）或配置 `sandbox.mode: "host"` 时，写手产出的任意代码（含 `package.json` 的 test/pretest 脚本）将以宿主用户全权限运行，结果标注【安全降级】/红色警告；docker 模式也不是完美隔离（共享宿主内核、镜像需可信）。
 - 审查完整性默认 fail-closed：审查输入被字符上限截断、或锁文件只送 SHA256 摘要时，`success` 恒为 false 并转人工；`allowTruncatedReview: true` 可显式放行（**降低安全保证**，message/files/日志会标注）。
 - 请在专用或一次性环境、最小权限账号下使用，并始终保留人工终审。
 
@@ -149,7 +149,7 @@ DACW 会执行模型生成的代码与命令。**测试在审查之前执行**�
 |---|---|
 | `plugin.ts` | DSH Host 半边：工具注册、子代理 preset、运行时工具隔离、模型解析、工作区闸门 |
 | `index.ts` | 协调器：轮次、基线合并、运行机调度、裁决、人工闸门 |
-| `sandbox.ts` | 沙箱策略层：auto（默认）/docker/host 决策、容器参数、Docker 探测、沙盒确认请求 |
+| `sandbox.ts` | 沙箱策略层：host（默认）/auto/docker 决策、容器参数、Docker 探测、auto 降级确认请求 |
 | `runner.ts` | 运行机：命令解析、超时强杀、输出截断 |
 | `state_manager.ts` | 状态：原子写、HMAC、串行队列 |
 | `build.mjs` / `selftest.mjs` | 构建（TS → `dist/`）与回归自测 |
