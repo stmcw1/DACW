@@ -47,7 +47,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 98 regression vectors
+node selftest.mjs                           # 100 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -140,6 +140,7 @@ DACW executes model-generated code and commands. **Tests execute before any revi
 - Default `sandbox.mode: "host"`: execution isolation is off, tests run with host-user privileges; setting `"auto"` containerizes when Docker is available and asks the human when it is not (keeping it or being unable to ask fails closed, never a silent downgrade).
 - When the user explicitly confirms a downgrade (`auto` with the sandbox disabled) or sets `sandbox.mode: "host"`, arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user, flagged as a **[security downgrade]** / red warning; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
 - Review completeness is fail-closed by default: truncated review input or a lockfile sent only as a digest makes `success` false and routes to the human gate; `allowTruncatedReview: true` explicitly lets it pass (**lowers the security guarantee**; message/files/logs are flagged).
+- Sensitive files (`.env`, `*.pem`, `*.key`, `credentials*`, `secrets*`, `id_rsa*` etc.) are not sent to model review by default (their content is not sent to the model), but they are still delivered and kept in the `files` manifest; the message lists them and they must be reviewed manually.
 - Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
 
 See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and disclaimer.

@@ -135,6 +135,31 @@ const LOCK_REVIEW_DIGEST_FILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.l
 /** 锁文件审查策略：只送 SHA256 摘要，不送全文（与下方摘要循环保持一致）。 */
 const LOCK_REVIEW_DIGEST_SET = new Set(LOCK_REVIEW_DIGEST_FILES);
 
+/**
+ * 敏感文件默认不送模型审查（内容不进入审查输入）；文件仍正常交付、仍在 `files` 清单中。
+ * 排除项记入 `reviewExcluded`，供 F3 断言（iteratedKeys ∪ reviewExcluded === postDigest）与 message 标注。
+ * 这是内容外发边界：秘密/AKey 不发给模型提供方，由人工在合入前审阅这些文件。
+ */
+const SENSITIVE_REVIEW_PATTERNS = [
+    /^\.env$/i,
+    /^\.env\..+$/i,
+    /\.pem$/i,
+    /\.key$/i,
+    /\.p12$/i,
+    /\.pfx$/i,
+    /^id_(rsa|dsa|ecdsa|ed25519)(\..+)?$/i,
+    /^\.npmrc$/i,
+    /^\.netrc$/i,
+    /^credentials(\..+)?$/i,
+    /^secrets?(\..+)?$/i,
+];
+
+/** 审查阶段是否应排除该文件（按文件名判定；子目录同样生效）。纯函数，供回归自测。 */
+export function isSensitiveReviewFile(relPath: string): boolean {
+    const base = String(relPath).split(/[\\/]/).pop() || '';
+    return SENSITIVE_REVIEW_PATTERNS.some((re) => re.test(base));
+}
+
 // [共享] 清理白名单（地基保护）：safeCleanWorkspace 保留 / mergeDelta 删除拦截 共用一份清单
 // `.dacw-workspace` 是 DACW 自己的目录标记，随工作区一起保留，不参与基线合并。
 const CLEAN_PROTECTED_PATTERNS = [
@@ -882,6 +907,8 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             let reviewPartial = false;     // G2：锁文件只送 SHA256 摘要——不构成语义审查
             /** F3：记录审查循环实际遍历到的键集（与 postDigest / finalFiles 做三边界一致性断言）。 */
             const iteratedKeys: string[] = [];
+            /** 敏感文件默认不送模型审查：记录被排除的键（文件仍交付，finalFiles 保留完整清单）。 */
+            const reviewExcluded = new Set<string>();
             /** G1：截断/未送审明细，用于 fail-closed 说明。 */
             const truncatedFiles: string[] = [];
             const unreviewedFiles: string[] = [];
@@ -938,8 +965,14 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 // 审查输入只来自对账后的最终清单（不变量 6）；每个文件都从磁盘读当前内容，不复用内存基线。
                 for (let i = 0; i < reviewKeys.length; i += 1) {
                     const rel = reviewKeys[i];
-                    iteratedKeys.push(rel);
                     const relDisplay = rel.split(path.sep).join('/');
+                    // 敏感文件：内容不进入审查输入（仍交付、仍在 files 清单中），记入 reviewExcluded 供 F3 与 message 使用。
+                    if (isSensitiveReviewFile(relDisplay)) {
+                        reviewExcluded.add(relDisplay);
+                        logError(context, `[审查排除] 敏感文件未送入模型审查：${relDisplay}（仍在交付清单中，请人工审阅）`);
+                        continue;
+                    }
+                    iteratedKeys.push(rel);
                     // 锁文件只送 SHA256 摘要（下方单独处理），避免超大文件挤占审查输入
                     if (LOCK_REVIEW_DIGEST_SET.has(relDisplay)) continue;
                     try {
@@ -1048,10 +1081,11 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, message, round);
             }
 
-            // F3：最终三边界一致性断言——postDigest === finalFiles === 审查遍历键集，
+            // F3：最终三边界一致性断言——`iteratedKeys ∪ reviewExcluded === postDigest.keys()`、
+            // finalFiles 保留完整清单（敏感文件确实交付，只是不送审）；
             // 且审查结束再枚举必须与 postDigest（及受保护目录指纹）一致（防审查期间被变动）。
             // 任一不等一律 success:false 转人工，绝不放行 success:true。
-            // （allowTruncatedReview=true 时允许遍历键集不完整，但 finalFiles 与再枚举一致性仍然强制。）
+            // （allowTruncatedReview=true 时允许审查不完整，但 finalFiles 与再枚举一致性仍然强制。）
             let recheckDigest: Map<string, string>;
             let recheckProtected: Map<string, string>;
             try {
@@ -1066,9 +1100,13 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             const boundaryProblems: string[] = [];
             const sameKeySet = (keys: string[], expected: Map<string, string>): boolean =>
                 keys.length === expected.size && keys.every((key) => expected.has(key));
-            if (!escapedIncomplete && !sameKeySet(iteratedKeys, postDigest)) {
-                boundaryProblems.push(`审查遍历键集与对账清单不一致（审查 ${iteratedKeys.length} 个 / 清单 ${postDigest.size} 个；`
-                    + '审查输入可能因字符上限被截断，不能视为完整审查）');
+            // F3：审查覆盖 = 实际遍历键集 ∪ 敏感排除集，必须完整覆盖对账清单。
+            const reviewedOrExcluded = new Set<string>([...iteratedKeys, ...reviewExcluded]);
+            if (!escapedIncomplete && reviewedOrExcluded.size !== postDigest.size) {
+                const missing = Array.from(postDigest.keys()).filter((key) => !reviewedOrExcluded.has(key));
+                boundaryProblems.push(`审查覆盖与对账清单不一致（已审 ${iteratedKeys.length} + 敏感排除 ${reviewExcluded.size} / 清单 ${postDigest.size}；`
+                    + '审查输入可能因字符上限被截断，不能视为完整审查）'
+                    + (missing.length > 0 ? `；未覆盖：${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ' …' : ''}` : ''));
             }
             if (finalFiles === null || !sameKeySet(finalFiles, postDigest)) {
                 boundaryProblems.push('finalFiles 与 postDigest 不一致');
@@ -1112,6 +1150,9 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             const truncatedNote = escapedIncomplete
                 ? '（【安全降级】审查不完整：allowTruncatedReview=true 放行了截断/仅摘要送审；未送审项已标注在 files 中）'
                 : '';
+            const sensitiveNote = reviewExcluded.size > 0
+                ? `（敏感文件未送模型审查，请在合入前人工审阅：${Array.from(reviewExcluded).slice(0, 10).join(', ')}${reviewExcluded.size > 10 ? ' …' : ''}）`
+                : '';
             const sandboxNote = sandboxPlan.kind === 'docker'
                 ? '（测试在一次性容器内执行：无网络、只读根文件系统、非 root、资源受限）'
                 : sandboxDisabledByConsent
@@ -1119,7 +1160,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                     : options.sandboxExplicit
                         ? '（警告：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
                         : '（默认策略：测试以宿主用户权限执行，未做隔离）';
-            return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}`, round);
+            return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}${sensitiveNote}`, round);
         }
 
         await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });

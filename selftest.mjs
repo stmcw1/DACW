@@ -16,7 +16,7 @@ const runnerModule = await import('./dist/runner.js');
 
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
-    enumerateWorkspace, diffDigest, fingerprintProtectedDirs,
+    enumerateWorkspace, diffDigest, fingerprintProtectedDirs, isSensitiveReviewFile,
 } = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
@@ -131,6 +131,14 @@ t('diffDigest：+ / - / ~ 三类差异，路径稳定排序且带原因', () => 
 });
 t('diffDigest：无差异返回空数组', () => {
     eq(diffDigest(new Map([['a.js', 'h1']]), new Map([['a.js', 'h1']])), []);
+});
+t('敏感文件识别：常见秘密文件命中、普通源码不命中（子目录同样生效）', () => {
+    for (const file of ['.env', '.env.local', 'config/server.pem', 'keys/client.key', 'id_rsa', 'id_ed25519', 'credentials.json', 'secrets.yaml', '.npmrc', '.netrc', 'a/b/private.p12', 'docs/secret.md']) {
+        assert.equal(isSensitiveReviewFile(file), true, file);
+    }
+    for (const file of ['src/app.js', 'README.md', 'package.json', '.envrc', 'src/keystore.ts']) {
+        assert.equal(isSensitiveReviewFile(file), false, file);
+    }
 });
 
 // ================= parseReviewVerdict：裁决回归 =================
@@ -660,7 +668,7 @@ try {
         return binDir;
     };
 
-    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions, askUserQuestion) => {
+    const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions, askUserQuestion, writerChanged) => {
         const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
         const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
         await fs.mkdir(wsDir, { recursive: true });
@@ -680,7 +688,8 @@ try {
                         if (reviewerAction) await reviewerAction(wsDir);
                         return '{"verdict":"PASS"}';
                     }
-                    return JSON.stringify({ changed: [{ file: 'main.js', code: 'console.log(1);\n' }], deleted: [] });
+                    const changed = writerChanged ?? [{ file: 'main.js', code: 'console.log(1);\n' }];
+                    return JSON.stringify({ changed, deleted: [] });
                 },
                 log: (message) => logs.push(message),
                 ...(askUserQuestion ? { askUserQuestion } : {}),
@@ -893,6 +902,28 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.equal(detected, false);
         assert.equal(asked, false);
         assert.equal(result.success, true);
+    });
+    await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
+        const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(
+            'sensitive-excluded',
+            'process.exit(0);',
+            null,
+            null,
+            undefined,
+            undefined,
+            [
+                { file: 'main.js', code: 'console.log(1);\n' },
+                { file: '.env', code: 'API_KEY=SECRET_VALUE_123\n' },
+            ]);
+        assert.equal(reviewerCalled, true);
+        assert.equal(result.success, true);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.ok(result.files.includes('.env'), JSON.stringify(result.files));
+        assert.ok(!reviewerInput.includes('SECRET_VALUE_123'), '敏感内容不应进入审查输入');
+        assert.ok(!reviewerInput.includes('--- 文件: .env ---'), '敏感文件不应出现在审查输入');
+        assert.match(result.message, /敏感文件未送模型审查/);
+        assert.match(result.message, /\.env/);
+        assert.ok(logs.some((line) => line.includes('[审查排除]')), JSON.stringify(logs));
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
