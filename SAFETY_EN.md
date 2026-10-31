@@ -53,6 +53,8 @@ With the default host mode (or when the user confirms disabling the sandbox unde
 
 ## Key boundaries
 
+- **Independent workspace (version-control isolation only; test execution still runs with host-user privileges)**: DACW reads, writes and resets files only inside the designated workspace, never modifying the main branch or other directories; this is version-control-level isolation, not execution isolation.
+- **Execution isolation is off by default (boundary declaration #9)**: tests run writer-produced code with host-user privileges; container isolation is an optional hardening (enabled only when `sandbox.mode: "auto"`/`"docker"` is set explicitly).
 - The plugin runs inside the DSH Host process and reads/writes the workspace and state files through `node:fs`, outside the DSH session file sandbox; effective file permissions are those of the system account running the Harness.
 - Writer/reviewer are real subagent sessions (visible in the profile); with an explicitly configured model, the task description and workspace code are sent to the selected model provider.
 - The workspace is reset to the non-foundation file set every round — destructive by design; `workspacePolicy: "allow"` skips the empty-directory/marker check.
