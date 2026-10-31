@@ -90,6 +90,8 @@ export interface PluginConfig {
     sandbox: SandboxConfig;
     /** G3 逃生门（默认 false）：允许截断/仅摘要的审查放行 success:true（降低安全保证）。 */
     allowTruncatedReview: boolean;
+    /** 写手输出秘密扫描（默认 true）；false 显式关闭（降低安全保证）。 */
+    secretScanEnabled: boolean;
 }
 
 export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
@@ -111,6 +113,7 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
     enforceChildToolIsolation: true,
     sandbox: DEFAULT_SANDBOX_CONFIG,
     allowTruncatedReview: false,
+    secretScanEnabled: true,
 };
 
 function positiveIntOr(value: unknown, fallback: number, warnings: string[], field: string): number {
@@ -195,6 +198,7 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
         enforceChildToolIsolation: input.enforceChildToolIsolation !== false,
         sandbox: normalizeSandboxConfig(input.sandbox, warnings, 'config.sandbox'),
         allowTruncatedReview: input.allowTruncatedReview === true,
+        secretScanEnabled: input.secretScanEnabled !== false,
     };
     if (config.chatTimeoutMaxMs < config.chatTimeoutBaseMs) {
         warnings.push('config.chatTimeoutMaxMs 小于 chatTimeoutBaseMs，已把 chatTimeoutMaxMs 提升到 base');
@@ -213,6 +217,9 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
     if (config.allowTruncatedReview) {
         warnings.push('config.allowTruncatedReview=true：审查输入被截断或锁文件仅送摘要时仍会返回 success:true，'
             + '安全保证降低（默认 fail-closed 拒绝）。');
+    }
+    if (!config.secretScanEnabled) {
+        warnings.push('config.secretScanEnabled=false：写手输出不再做凭据模式扫描，密钥可能进入代码/审查上下文（安全保证降低）。');
     }
     return { config, warnings, sandboxExplicit };
 }
@@ -1139,6 +1146,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 sandbox: config.sandbox,
                 sandboxExplicit,
                 allowTruncatedReview: config.allowTruncatedReview,
+                secretScanEnabled: config.secretScanEnabled,
             });
             const rawTaskId = taskIdArg || `dacw-${Date.now().toString(36)}`;
             const result = await executeTask(rawTaskId, workspaceDir, task);

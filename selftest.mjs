@@ -16,7 +16,7 @@ const runnerModule = await import('./dist/runner.js');
 
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
-    enumerateWorkspace, diffDigest, fingerprintProtectedDirs, isSensitiveReviewFile,
+    enumerateWorkspace, diffDigest, fingerprintProtectedDirs, isSensitiveReviewFile, scanWriterOutputForSecrets,
 } = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
@@ -139,6 +139,43 @@ t('敏感文件识别：常见秘密文件命中、普通源码不命中（子�
     for (const file of ['src/app.js', 'README.md', 'package.json', '.envrc', 'src/keystore.ts']) {
         assert.equal(isSensitiveReviewFile(file), false, file);
     }
+});
+t('秘密扫描：五类凭据模式命中并返回人话类别（不含原文），首个命中即停', () => {
+    const changed = (code, file = 'x.js') => ({ changed: [{ file, code }], deleted: [], legacyFull: false });
+    const cases = [
+        ['PEM 私钥', '-----BEGIN RSA PRIVATE KEY-----\nMIIE...'],
+        ['AWS Access Key', 'const k = "AKIAABCDEFGHIJKLMNOP";'],
+        ['GitHub Token', 'ghp_' + 'a'.repeat(36)],
+        ['Slack Token', 'xoxb-1234567890-abcdefghij'],
+        ['OpenAI Key', 'sk-' + 'a'.repeat(40)],
+    ];
+    for (const [category, code] of cases) {
+        const hit = scanWriterOutputForSecrets(changed(code));
+        eq(hit, { file: 'x.js', category });
+        assert.ok(!JSON.stringify(hit).includes(code), `命中结果不得包含原文（${category}）`);
+    }
+    // 首个命中即停：按 delta.changed 顺序 + 模式表顺序返回第一个
+    eq(scanWriterOutputForSecrets({
+        changed: [
+            { file: 'a.js', code: 'console.log(1)' },
+            { file: 'b.js', code: 'AKIAABCDEFGHIJKLMNOP' },
+            { file: 'c.js', code: '-----BEGIN RSA PRIVATE KEY-----' },
+        ],
+        deleted: [], legacyFull: false,
+    }), { file: 'b.js', category: 'AWS Access Key' });
+    // 无命中返回 null
+    eq(scanWriterOutputForSecrets(changed('const ok = 1;')), null);
+});
+t('秘密扫描配置：默认开启，仅显式 false 关闭（引擎 + 插件配置）', () => {
+    assert.equal(DEFAULT_ENGINE_OPTIONS.secretScanEnabled, true);
+    assert.equal(resolveEngineOptions(null).secretScanEnabled, true);
+    assert.equal(resolveEngineOptions({ secretScanEnabled: false }).secretScanEnabled, false);
+    const defaults = normalizePluginConfig({ workspacePolicy: 'guarded' });
+    assert.equal(defaults.config.secretScanEnabled, true);
+    assert.equal(defaults.warnings.length, 0, JSON.stringify(defaults.warnings));
+    const off = normalizePluginConfig({ workspacePolicy: 'guarded', secretScanEnabled: false });
+    assert.equal(off.config.secretScanEnabled, false);
+    assert.ok(off.warnings.some((w) => w.includes('secretScanEnabled')), JSON.stringify(off.warnings));
 });
 
 // ================= parseReviewVerdict：裁决回归 =================
@@ -975,6 +1012,25 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
         const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
         eq(persisted.reviewExcluded, ['z-secret.pem']);
+    });
+    await ta('秘密扫描审计：命中写入状态 secretScanHits（文件:类别，不含原文）', async () => {
+        const secretCode = 'const k = "AKIAABCDEFGHIJKLMNOP";\n';
+        const { result, logs } = await runReconWorkflow(
+            'secret-audit',
+            'process.exit(0);',
+            null,
+            null,
+            undefined,
+            undefined,
+            [{ file: 'main.js', code: secretCode }]);
+        assert.equal(result.status, 'NEED_HUMAN');
+        assert.ok(logs.some((line) => line.includes('[秘密扫描]')), JSON.stringify(logs));
+        const stateDir = path.join(tmpRoot, 'state-recon-secret-audit');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const rawState = await fs.readFile(path.join(stateDir, stateName), 'utf8');
+        const persisted = JSON.parse(rawState);
+        eq(persisted.secretScanHits, ['main.js:AWS Access Key']);
+        assert.ok(!rawState.includes('AKIAABCDEFGHIJKLMNOP'), '状态文件不得记录密钥原文');
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {

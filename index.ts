@@ -75,6 +75,8 @@ export interface EngineOptions {
      * 打开即降低安全保证：只有显式配置才生效，且 message/日志/files 会持续标注。
      */
     allowTruncatedReview: boolean;
+    /** 写手输出秘密扫描（默认开启）：命中凭据模式时记录审计并按处置规则处理；false 显式关闭（降低安全保证）。 */
+    secretScanEnabled: boolean;
     /** 沙盒探测函数（回归测试 / 宿主自定义）；null 表示使用内置 detectDocker。 */
     sandboxDetect: SandboxDetector | null;
 }
@@ -94,6 +96,7 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
     sandbox: DEFAULT_SANDBOX_CONFIG,
     sandboxExplicit: false,
     allowTruncatedReview: false,
+    secretScanEnabled: true,
     sandboxDetect: null,
 };
 
@@ -126,6 +129,7 @@ export function resolveEngineOptions(partial?: Partial<EngineOptions> | null): E
         sandbox: normalizeSandboxConfig(partial.sandbox, [], 'sandbox'),
         sandboxExplicit: partial.sandboxExplicit === true,
         allowTruncatedReview: partial.allowTruncatedReview === true,
+        secretScanEnabled: partial.secretScanEnabled !== false,
         sandboxDetect: typeof partial.sandboxDetect === 'function' ? partial.sandboxDetect : null,
     };
 }
@@ -655,6 +659,28 @@ export function parseWriterDelta(raw: string, maxChars: number = DEFAULT_ENGINE_
     throw new Error('输出形态无法识别：需要 {"changed":[{"file","code"}],"deleted":[...]} 或旧版 [{"file","code"}] 数组');
 }
 
+/** 写手输出秘密扫描的检测模式（命中行为：拒；category 为人类可读类别名，绝不返回原文）。 */
+const SECRET_SCAN_PATTERNS: { category: string; re: RegExp }[] = [
+    { category: 'PEM 私钥', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+    { category: 'AWS Access Key', re: /AKIA[0-9A-Z]{16}/ },
+    { category: 'GitHub Token', re: /ghp_[A-Za-z0-9]{36}/ },
+    { category: 'Slack Token', re: /xox[baprs]-[A-Za-z0-9-]{10,}/ },
+    { category: 'OpenAI Key', re: /sk-[A-Za-z0-9]{32,}/ },
+];
+
+/**
+ * 扫描写手输出（`delta.changed[].code`）中的凭据模式：首个命中即返回 `{ file, category }`。
+ * 纯函数；只返回文件名与人类可读类别名，**不返回命中的原文**（避免二次泄露）。
+ */
+export function scanWriterOutputForSecrets(delta: WriterDelta): { file: string; category: string } | null {
+    for (const item of delta.changed) {
+        for (const pattern of SECRET_SCAN_PATTERNS) {
+            if (pattern.re.test(item.code)) return { file: item.file, category: pattern.category };
+        }
+    }
+    return null;
+}
+
 function buildManifest(baseFiles: Map<string, string>, maxEntries: number): string {
     if (baseFiles.size === 0) return '(空——本轮需产出全部文件)';
     const lines: string[] = [];
@@ -800,6 +826,20 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 await stateManager.update((s) => { s.lastError = `写手阶段崩溃：${e.message}`; });
                 await conversation.discardSinceCheckpoint();
                 continue;
+            }
+
+            // 秘密扫描（默认开启）：命中仅记录审计（文件:类别，不记录原文）+ 日志告警；
+            // 命中处置规则（拒/打回）由后续步骤接入，本轮不阻断流程。
+            if (options.secretScanEnabled) {
+                const secretHit = scanWriterOutputForSecrets(delta);
+                await stateManager.update((s) => {
+                    s.secretScanHits = secretHit ? [`${secretHit.file}:${secretHit.category}`] : null;
+                });
+                if (secretHit) {
+                    logError(context, `[秘密扫描] 写手输出命中凭据模式：${secretHit.file}（${secretHit.category}）；已记录审计（不记录原文）。`);
+                }
+            } else {
+                await stateManager.update((s) => { s.secretScanHits = null; });
             }
 
             try {

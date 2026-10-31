@@ -20,6 +20,8 @@ export interface WorkflowState {
     reviewResult: string | null;
     /** 本轮审查阶段因敏感被排除、未送模型审查的文件清单（审计可追溯）；null 表示无排除。 */
     reviewExcluded: string[] | null;
+    /** 写手输出秘密扫描命中记录（"文件:类别"，不含原文）；null 表示未命中或未启用扫描。 */
+    secretScanHits: string[] | null;
     lastError: string | null;      
 }
 
@@ -33,6 +35,7 @@ interface PersistedState {
     testResult: string | null;
     reviewResult: string | null;
     reviewExcluded: string[] | null;
+    secretScanHits: string[] | null;
     lastError: string | null;
     checksum: string;
 }
@@ -80,10 +83,12 @@ export class StateManager {
     }
 
     private checksumOf(state: WorkflowState): string {
-        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, lastError } = state;
+        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, lastError } = state;
         const body = JSON.stringify({
             taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
-            reviewExcluded: reviewExcluded ?? null, lastError,
+            reviewExcluded: reviewExcluded ?? null,
+            secretScanHits: secretScanHits ?? null,
+            lastError,
         });
         return this.macOf(body);
     }
@@ -150,7 +155,7 @@ export class StateManager {
             const initial: WorkflowState = {
                 taskId: this.taskId, round: 1, status: 'RUNNING', taskPrompt,
                 writtenFiles: null, testResult: null, reviewResult: null,
-                reviewExcluded: null, lastError: null
+                reviewExcluded: null, secretScanHits: null, lastError: null
             };
             await this.persist(initial);
             this.authoritative = initial;

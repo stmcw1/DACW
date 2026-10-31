@@ -50,7 +50,7 @@ for (const file of SOURCES) {
 const engine = await import(pathToFileURL(path.join(outDir, 'index.js')));
 const plugin = await import(pathToFileURL(path.join(outDir, 'plugin.js')));
 
-for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict', 'enumerateWorkspace', 'fingerprintProtectedDirs', 'diffDigest', 'isSensitiveReviewFile']) {
+for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict', 'enumerateWorkspace', 'fingerprintProtectedDirs', 'diffDigest', 'isSensitiveReviewFile', 'scanWriterOutputForSecrets']) {
   if (typeof engine[name] !== 'function') throw new Error(`build: dist/index.js does not export ${name}()`);
 }
 for (const name of ['apply', 'normalizePluginConfig', 'extractTextBlocks', 'buildActivationSpec', 'restrictChildTools', 'runSubagentChat']) {
