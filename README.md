@@ -4,7 +4,6 @@
   </a>
   <p><i> 点击 or click</i></p>
 </div>
-<div align="center">
 
 <div align="center">
 
