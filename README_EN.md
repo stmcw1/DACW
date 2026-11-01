@@ -1,4 +1,11 @@
 <div align="center">
+  <a href="https://stmcw1.github.io/DACW/dacw-workflow.html" target="_blank">
+    <img src="https://stmcw1.github.io/DACW/dacw.webp" alt="DACW workflow diagram" width="100%">
+  </a>
+  <p><i>Click to open the workflow diagram (中文)</i></p>
+</div>
+
+<div align="center">
 
 # DACW — Defensive Agent Coding Workflow
 
