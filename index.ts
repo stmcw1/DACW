@@ -670,7 +670,7 @@ function buildManifest(baseFiles: Map<string, string>, maxEntries: number): stri
     for (const [file, code] of baseFiles) {
         if (n >= maxEntries) { lines.push(`...（其余 ${baseFiles.size - n} 个文件略）`); break; }
         const sha8 = crypto.createHash('sha256').update(code, 'utf8').digest('hex').slice(0, 8);
-        lines.push(`${file} (${Buffer.byteLength(code, 'utf8')}B sha8:${sha8})`);
+        lines.push(`${file} (${Buffer.byteLength(code, 'utf8')}B, ${code.split('\n').length} 行 sha8:${sha8})`);
         n++;
     }
     return lines.join('\n');
@@ -1202,6 +1202,20 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
 
             await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });
             logSuccess(context, '全链路通过！进入人工闸门审核。');
+            // D 组：交付清单行数汇总（写进 finish message）；随后在清单条目上标注敏感文件
+            //（敏感文件仍交付，只是未送模型审查——用后缀与"截断/未送审"区分）。
+            const deliveredFiles = finalFiles ?? Array.from(baseFiles.keys());
+            const totalLines = deliveredFiles.reduce((sum, rel) => {
+                const content = baseFiles.get(rel);
+                if (content !== undefined) return sum + content.split('\n').length;
+                // 地基文件等不在写手基线里的交付物：从磁盘读取（此时已通过 F3，内容即交付内容）。
+                try { return sum + fsSync.readFileSync(path.join(workspaceDir, rel), 'utf8').split('\n').length; }
+                catch { return sum; }
+            }, 0);
+            if (finalFiles !== null) {
+                finalFiles = finalFiles.map((rel) => (isSensitiveReviewFile(rel) ? `${rel}（敏感·未送审）` : rel));
+            }
+            const linesNote = `（交付 ${deliveredFiles.length} 个文件，合计 ${totalLines} 行）`;
             const truncatedNote = escapedIncomplete
                 ? '（【安全降级】审查不完整：allowTruncatedReview=true 放行了截断/仅摘要送审；未送审项已标注在 files 中）'
                 : '';
@@ -1215,7 +1229,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                     : options.sandboxExplicit
                         ? '（警告：测试以宿主用户全权限执行——写手产出的代码已在你的账号下运行）'
                         : '（默认策略：测试以宿主用户权限执行，未做隔离）';
-            return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}${sensitiveNote}`, round);
+            return finish(true, `代码已通过机器测试与审查，需人工确认合入${sandboxNote}${truncatedNote}${sensitiveNote}${linesNote}`, round);
         }
 
         await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });

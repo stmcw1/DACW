@@ -992,17 +992,24 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.equal(reviewerCalled, true);
         assert.equal(result.success, true);
         assert.equal(result.status, 'NEED_HUMAN');
-        assert.ok(result.files.includes('.env'), JSON.stringify(result.files));
+        // D 组：敏感文件仍在交付清单，但带「敏感·未送审」后缀
+        assert.ok(result.files.includes('.env（敏感·未送审）'), JSON.stringify(result.files));
+        assert.ok(!result.files.includes('.env'), '敏感文件不应以裸名出现（避免看起来像已送审）');
         assert.ok(!reviewerInput.includes('SECRET_VALUE_123'), '敏感内容不应进入审查输入');
         assert.ok(!reviewerInput.includes('--- 文件: .env ---'), '敏感文件不应出现在审查输入');
         assert.match(result.message, /敏感文件未送模型审查/);
         assert.match(result.message, /\.env/);
+        // D 组：finish message 行数汇总（main.js 2 行 + .env 2 行 + package.json 1 行 = 5 行）
+        assert.match(result.message, /（交付 3 个文件，合计 5 行）/);
         assert.ok(logs.some((line) => line.includes('[审查排除]')), JSON.stringify(logs));
         // 审计可追溯：状态文件记录本轮被排除的敏感文件
         const stateDir = path.join(tmpRoot, 'state-recon-sensitive-excluded');
         const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
         const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
         eq(persisted.reviewExcluded, ['.env']);
+        // D 组：buildManifest 条目含行数（writtenFiles 格式保持字符串清单）
+        assert.match(String(persisted.writtenFiles), /main\.js \(\d+B, 2 行 sha8:[0-9a-f]{8}\)/);
+        assert.match(String(persisted.writtenFiles), /\.env \(\d+B, 2 行 sha8:[0-9a-f]{8}\)/);
     });
     await ta('零送审：全部文件被敏感排除 → success:false、转人工、message 明确', async () => {
         // 删除 package.json 以构造"工作区只有敏感文件"的零送审场景（否则 package.json 会被正常送审）。
@@ -1038,12 +1045,14 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
                 { file: 'z-secret.pem', code: 'PRIVATE-KEY-MATERIAL\n' },
             ]);
         assert.equal(result.success, true);   // 逃生门开启：截断可放行
-        assert.ok(result.files.includes('z-secret.pem'), JSON.stringify(result.files));
+        // D 组：敏感文件仍交付，但带「敏感·未送审」后缀（不能标成截断/输入上限）
+        assert.ok(result.files.includes('z-secret.pem（敏感·未送审）'), JSON.stringify(result.files));
         assert.equal(
-            result.files.some((file) => file.startsWith('z-secret.pem（')),
+            result.files.some((file) => file.startsWith('z-secret.pem（未送审') || file.startsWith('z-secret.pem（审查输入')),
             false, '敏感文件不应被标注为截断/未送审：' + JSON.stringify(result.files));
         assert.match(result.message, /敏感文件未送模型审查/);
         assert.match(result.message, /z-secret\.pem/);
+        assert.match(result.message, /（交付 \d+ 个文件，合计 \d+ 行）/);
         assert.ok(logs.some((line) => line.includes('[安全降级]')), JSON.stringify(logs));
         const stateDir = path.join(tmpRoot, 'state-recon-truncated-sensitive');
         const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
