@@ -31,6 +31,7 @@ import {
     resolveDockerExecutable,
 } from './sandbox';
 import type { ExecutionPolicy } from './sandbox';
+import { redactSecretsInText } from './secrets';
 
 export interface RunResult {
     success: boolean;
@@ -285,6 +286,8 @@ export class Runner {
             const stderrDecoder = new StringDecoder('utf8');
             let lineOpen = false;
 
+            // 注意：流式 appendLog 不做脱敏——密钥可能被 \n 或 chunk 边界切开，逐 chunk 正则匹配
+            // 不可靠；脱敏统一在 finalize 对拼装完成的完整 output 一次性执行（见 finalize）。
             const appendLog = (data: Buffer, decoder: StringDecoder, tag: string) => {
                 if (output.length >= this.HARD_LIMIT_CHARS) {
                     truncated = true;
@@ -353,6 +356,9 @@ export class Runner {
                 if (timedOut) {
                     finalOutput += `\n[执行超时 ${timeoutMs}ms，运行机已强杀进程树；exitCode=${exitCode ?? 'null'}, signal=${exitSignal ?? 'none'}]`;
                 }
+                // C 组：finalOutput 落定前对完整文本一次性脱敏（5 类凭据 → [REDACTED:<类别>]）。
+                // 下游（stateManager.testResult / feedback / 日志 / 结果 message）只接触脱敏文本。
+                finalOutput = redactSecretsInText(finalOutput);
                 resolve({
                     success: !timedOut && exitCode === 0,
                     exitCode,

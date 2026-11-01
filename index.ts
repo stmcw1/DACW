@@ -27,6 +27,10 @@ import { Runner } from './runner';
 import { StateManager } from './state_manager';
 import { DEFAULT_SANDBOX_CONFIG, buildSandboxConsentRequest, describePolicy, detectDocker, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
 import type { ExecutionPolicy, SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
+import { scanWriterOutputForSecrets } from './secrets';
+
+// B 组的纯函数由 secrets.ts 提供（与 C 组运行机脱敏共用同一套模式），此处保留导出以兼容既有调用方。
+export { scanWriterOutputForSecrets };
 
 /**
  * 协调器对宿主的最小依赖面。
@@ -657,28 +661,6 @@ export function parseWriterDelta(raw: string, maxChars: number = DEFAULT_ENGINE_
         if (typeof obj.file === 'string' && typeof obj.code === 'string') return { changed: [{ file: obj.file, code: obj.code }], deleted: [], legacyFull: true };
     }
     throw new Error('输出形态无法识别：需要 {"changed":[{"file","code"}],"deleted":[...]} 或旧版 [{"file","code"}] 数组');
-}
-
-/** 写手输出秘密扫描的检测模式（命中行为：拒；category 为人类可读类别名，绝不返回原文）。 */
-const SECRET_SCAN_PATTERNS: { category: string; re: RegExp }[] = [
-    { category: 'PEM 私钥', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
-    { category: 'AWS Access Key', re: /AKIA[0-9A-Z]{16}/ },
-    { category: 'GitHub Token', re: /ghp_[A-Za-z0-9]{36}/ },
-    { category: 'Slack Token', re: /xox[baprs]-[A-Za-z0-9-]{10,}/ },
-    { category: 'OpenAI Key', re: /sk-[A-Za-z0-9]{32,}/ },
-];
-
-/**
- * 扫描写手输出（`delta.changed[].code`）中的凭据模式：首个命中即返回 `{ file, category }`。
- * 纯函数；只返回文件名与人类可读类别名，**不返回命中的原文**（避免二次泄露）。
- */
-export function scanWriterOutputForSecrets(delta: WriterDelta): { file: string; category: string } | null {
-    for (const item of delta.changed) {
-        for (const pattern of SECRET_SCAN_PATTERNS) {
-            if (pattern.re.test(item.code)) return { file: item.file, category: pattern.category };
-        }
-    }
-    return null;
 }
 
 function buildManifest(baseFiles: Map<string, string>, maxEntries: number): string {

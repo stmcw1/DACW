@@ -13,6 +13,9 @@ const engine = await import('./dist/index.js');
 const plugin = await import('./dist/plugin.js');
 const sandbox = await import('./dist/sandbox.js');
 const runnerModule = await import('./dist/runner.js');
+const secretsModule = await import('./dist/secrets.js');
+
+const { redactSecretsInText } = secretsModule;
 
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
@@ -165,6 +168,23 @@ t('秘密扫描：五类凭据模式命中并返回人话类别（不含原文�
     }), { file: 'b.js', category: 'AWS Access Key' });
     // 无命中返回 null
     eq(scanWriterOutputForSecrets(changed('const ok = 1;')), null);
+});
+t('运行机输出脱敏：五类凭据替换为 [REDACTED:<类别>] 且保留结构、可多命中', () => {
+    const samples = [
+        ['PEM 私钥', '-----BEGIN RSA PRIVATE KEY-----'],
+        ['AWS Access Key', 'AKIAABCDEFGHIJKLMNOP'],
+        ['GitHub Token', 'ghp_' + 'a'.repeat(36)],
+        ['Slack Token', 'xoxb-1234567890-abcdefghij'],
+        ['OpenAI Key', 'sk-' + 'a'.repeat(40)],
+    ];
+    for (const [category, secret] of samples) {
+        const text = `before ${secret} after`;
+        eq(redactSecretsInText(text), `before [REDACTED:${category}] after`);
+    }
+    const multi = redactSecretsInText(`a sk-${'b'.repeat(40)} and AKIAABCDEFGHIJKLMNOP end`);
+    assert.match(multi, /\[REDACTED:OpenAI Key\]/);
+    assert.match(multi, /\[REDACTED:AWS Access Key\]/);
+    eq(redactSecretsInText('no secrets here'), 'no secrets here');
 });
 t('秘密扫描配置：默认开启，仅显式 false 关闭（引擎 + 插件配置）', () => {
     assert.equal(DEFAULT_ENGINE_OPTIONS.secretScanEnabled, true);
@@ -690,6 +710,20 @@ try {
             process.env.PATH = prevPath;
         }
     });
+    await ta('运行机：stdout 含 key → RunResult.output 已脱敏（C 组）', async () => {
+        const prevPath = process.env.PATH;
+        process.env.PATH = path.dirname(process.execPath) + path.delimiter + (prevPath ?? '');
+        try {
+            const rawKey = 'sk-' + 'c'.repeat(40);
+            const runner = new Runner(tmpRoot, { kind: 'host' });
+            const result = await runner.run('node', ['-e', `process.stdout.write(${JSON.stringify(rawKey)})`], 15000);
+            assert.equal(result.success, true, result.output);
+            assert.match(result.output, /\[REDACTED:OpenAI Key\]/);
+            assert.ok(!result.output.includes(rawKey), 'RunResult.output 不得包含密钥原文');
+        } finally {
+            process.env.PATH = prevPath;
+        }
+    });
 
     // ---- 测试后对账（不变量 6）：假 npm 模拟「测试期改写工作区」 ----
     const makeFakeNpm = async (name, scriptBody) => {
@@ -1080,6 +1114,33 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.match(String(persisted.lastError), /secretScanEnabled=false/);
         eq(persisted.secretScanHits, null);
         assert.ok(!rawState.includes(apiKey), '状态文件不得记录密钥原文');
+    });
+    await ta('引擎：测试输出 key → testResult/feedback/日志均为脱敏文本（C 组）', async () => {
+        const rawKey = 'sk-' + 'd'.repeat(40);
+        // 假 npm：把 key 打到 stdout 后退出码 1，触发「测试失败 → feedback 含测试输出」链路。
+        const scriptBody = `process.stdout.write(${JSON.stringify(rawKey)} + '\\n');\nprocess.exit(1);`;
+        const { result, logs, writerContexts } = await runReconWorkflow(
+            'runner-redaction',
+            scriptBody,
+            null,
+            null,
+            { maxRounds: 2 });
+        assert.equal(result.success, false);
+        // 状态文件 testResult 已脱敏
+        const stateDir = path.join(tmpRoot, 'state-recon-runner-redaction');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const rawState = await fs.readFile(path.join(stateDir, stateName), 'utf8');
+        const persisted = JSON.parse(rawState);
+        assert.match(String(persisted.testResult), /\[REDACTED:OpenAI Key\]/);
+        assert.ok(!rawState.includes(rawKey), '状态文件不得包含密钥原文');
+        // feedback（下一轮写手 system prompt）已脱敏
+        assert.ok(writerContexts.length >= 2, String(writerContexts.length));
+        assert.match(writerContexts[1], /\[REDACTED:OpenAI Key\]/);
+        assert.ok(!writerContexts[1].includes(rawKey), 'feedback 不得包含密钥原文');
+        // 日志已脱敏
+        const allLogs = logs.join('\n');
+        assert.match(allLogs, /\[REDACTED:OpenAI Key\]/);
+        assert.ok(!allLogs.includes(rawKey), '日志不得包含密钥原文');
     });
 
     await ta('引擎启动日志：显示写手/审查者模型配置', async () => {
