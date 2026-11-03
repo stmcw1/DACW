@@ -23,32 +23,31 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 - **Zero-tool child isolation**: writer/reviewer run on persona-only presets; on `agent/created` the plugin uses `ctx.tools.restrict({ allow: [] })` to strip every inherited tool and verifies the child sees zero tools. If isolation fails, the child is never created.
 - **Independent workspace (version-control isolation only; test execution still runs with host-user privileges)**: DACW reads, writes and resets files only inside the dedicated workspace directory, never touching the main branch or other directories; this is version-control-level isolation, and test commands still execute with host-user privileges.
 - **Execution isolation off by default (host)**: `sandbox.mode` defaults to `"host"` — tests run writer-produced code with host-user privileges (no container isolation). Set `"auto"` explicitly to containerize when Docker is available and to get an interactive confirmation when it is not (keeping the sandbox or being unable to ask fails closed).
-- **Output protocol v2**: the writer emits only deltas against the baseline, untouched files are preserved byte-for-byte, which cuts tokens and prevents "the code that passed last round got broken" regressions.
+- **Output protocol v2**: the writer emits only deltas against the baseline, untouched files are preserved byte-for-byte, which reduces tokens (untouched files are not re-emitted) and prevents "the code that passed last round got broken" regressions.
 - **Deterministic runner**: command whitelist (npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go), environment whitelist, timeout tree-kill, output truncation.
 - **Structured review**: the verdict must be exact JSON; unparseable output is treated as REJECTED; PASS containing suspicious wording goes to the human gate.
 - **Configurable models**: writer/reviewer can each inherit the parent session route or select from the DSH configured-model directory; the startup log and the result object show the models actually in effect.
 - **Workspace safety gate**: accepts only an empty directory or a valid `.dacw-workspace` marker written by this plugin; refuses filesystem roots, the user home directory, and `DSH_HOME`/profile directories; writes are checked with realpath plus per-segment symlink checks.
 - **Audit record**: the state file records the task, file manifest summary, test output and review text, verified with SHA-256 (guards against accidental corruption/edits; not against a same-account local user recomputing it — same boundary as audit logs).
+- **Secret controls**: writer-output credential scanning (a hit rejects that round), sensitive files excluded from model review, runner-output secret redaction (`[REDACTED:<category>]`).
+- **Rollback (human-triggered)**: a rollback point is captured before the task starts (git HEAD or workspace backup); `dacw_rollback` requires `confirm: true` plus interactive confirmation (headless hosts use `DACW_ROLLBACK_TOKEN`); git workspaces get instructions only, non-git workspaces restore from the backup.
 
 > **Trust boundary**: tests execute before any review, so review is a detective control, not a preventive one; child tool isolation is not a code-execution security boundary. See [SAFETY_EN.md](SAFETY_EN.md).
 
 ## How it works
 
-```
-Writer (JSON changeset) → Orchestrator (validate / merge / write) → Runner (project tests)
-                                                                    │ failure → rewrite (up to maxRounds)
-                                                              Reviewer (JSON verdict) → human gate NEED_HUMAN
-```
+Writer (incremental JSON changeset) → Orchestrator (validate / merge / write) → Runner (project tests) → Reviewer (JSON verdict) → human gate (`NEED_HUMAN`).
 
-1. The writer emits deltas under protocol v2.
-2. The orchestrator escape-checks paths, merges the baseline, and resets the workspace to the merged set.
-3. The runner executes tests by project type (re-sniffed every round) — **this is the first execution of writer-produced code, and it happens before review**.
-4. The reviewer audits the full file set plus foundation files (lockfiles as SHA256 digests).
-5. On PASS the tool returns `success: true` and `status: "NEED_HUMAN"`; every other path also converges to the human gate.
+- **Key constraints**: tests execute before review (review is a detective control, not a pre-execution barrier); every round resets the workspace to the merged set and untouched files are preserved byte-for-byte.
+- Diagram and full boundaries: cover image / [docs/dacw-workflow.html](docs/dacw-workflow.html) and [SAFETY_EN.md](SAFETY_EN.md).
 
 ## Install
 
-> **Prerequisite (DSH host environment)**: **DSH ≥ 0.2.1-rc.5 (current tested version)**. The host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). At activation DACW probes the required host capabilities (`ctx.tools.register`, `ctx.tools.restrict` when required by config, `agentPresets.register`, `subagents.getProvider/startActivation`) and refuses to activate with a "host incompatible" error when any is missing; an unregistered `spawn` provider only logs a warning (possibly a load-order issue) and is checked again — and refused — at `dacw_run` time. On an older host DACW fails closed and refuses to run, preserving the isolation safety floor: subagents must run on zero-tool presets and isolation must be verifiable; in addition, when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused as well (fail-closed) — there is no silent fallback to host execution.
+> **Prerequisite (version + services)**: **DSH ≥ 0.2.1-rc.5 (current tested version)**. The host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended).
+
+> **Activation probe**: at activation DACW probes the required host capabilities (`ctx.tools.register`, `ctx.tools.restrict` when required by config, `agentPresets.register`, `subagents.getProvider/startActivation`) and refuses to activate with a "host incompatible" error when any is missing; an unregistered `spawn` provider only logs a warning (possibly a load-order issue) and is checked again — and refused — at `dacw_run` time.
+
+> **Sandbox fail-closed**: on an older host, or when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused (fail-closed) — there is no silent fallback to host execution; subagents must run on zero-tool presets and isolation must be verifiable.
 
 Dependencies: DACW relies on the DSH host services `ctx.subagents`, `agentPresets` and `tools`, plus DSH's official `dsh-persona` and `dsh-subagent-spawn-in-process`. No third-party or community plugins are required.
 
@@ -62,7 +61,7 @@ node selftest.mjs                           # 128 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
-In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.0.2.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
+In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.1.0.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
 
 Upgrade: edit sources → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` the same tarball → restart the Harness.
 
@@ -97,7 +96,16 @@ On workflow failure the tool throws (including workspace, status, round and log 
 
 ### Rollback (dacw_rollback)
 
-Rollback is a high-impact operation. The tool requests an interactive human confirmation (DSH `userQuestions`); when the host has no interaction capability, set `DACW_ROLLBACK_TOKEN=<any non-empty string>` in the DSH host environment — otherwise execution is refused.
+Rollback is a high-impact operation: calls **must pass `confirm: true`** (a boolean literal; omitted or any non-`true` value is rejected before touching the filesystem), and the tool then requests an interactive human confirmation (DSH `userQuestions`); when the host has no interaction capability, set `DACW_ROLLBACK_TOKEN=<any non-empty string>` in the DSH host environment — otherwise execution is refused.
+
+Arguments (`dacw_rollback`):
+
+| Argument | Required | Description |
+|---|---|---|
+| `task_id` | yes | Task ID returned by `dacw_run` |
+| `confirm` | yes | Must be `true`; `false` / `"true"` / `1` and any non-literal-`true` value are rejected |
+| `workspace` | no | Same workspace resolution as `dacw_run` (omitted means the configured value / session working directory) |
+| `reason` | no | Rollback reason recorded in the audit, up to 500 characters |
 
 - **git workspaces**: returns rollback instructions (`git reset --hard <commit>`); executes no git command and modifies no files.
 - **Non-git workspaces**: restores from the backup. Interactive confirmation or token authorization is required before execution.
@@ -131,7 +139,7 @@ config:
     tmpfsMb: 128
 ```
 
-Container constraints in docker mode (sandbox branch): `--network none` (no network), read-only root filesystem (only a /tmp tmpfs is writable), non-root (uid/gid 1000), `--cap-drop ALL`, `no-new-privileges`, memory / CPU / PID limits, `--rm` one-shot; the workspace is copied into a disposable staging directory and that copy is mounted — the host workspace itself never enters the container. Pre-pull the image on first use (node default `node:22-bookworm-slim`, python `python:3.12-slim`, cargo `rust:1-slim`, go `golang:1.23-bookworm`).
+Container constraints in docker mode: `--network none` (no network), read-only root filesystem (only a /tmp tmpfs is writable), non-root (uid/gid 1000), `--cap-drop ALL`, `no-new-privileges`, memory / CPU / PID limits, `--rm` one-shot; the workspace is copied into a disposable staging directory and that copy is mounted — the host workspace itself never enters the container. Pre-pull the image on first use (node default `node:22-bookworm-slim`, python `python:3.12-slim`, cargo `rust:1-slim`, go `golang:1.23-bookworm`).
 
 ## Model configuration
 
@@ -166,14 +174,13 @@ DACW does not distinguish model sources — its defenses work the same way. Note
 
 ## Safety
 
-Execution isolation is off by default: tests run with host-user privileges; setting `sandbox.mode: "auto"` explicitly containerizes when Docker is available and asks the human when it is not (keeping the sandbox or being unable to ask fails closed).
-
 DACW executes model-generated code and commands. **Tests execute before any review**, so review (including the human gate) is a detective control, not a pre-execution security barrier; child tool isolation is not a code-execution security boundary.
 
 - Default `sandbox.mode: "host"`: execution isolation is off, tests run with host-user privileges; setting `"auto"` containerizes when Docker is available and asks the human when it is not (keeping it or being unable to ask fails closed, never a silent downgrade).
 - When the user explicitly confirms a downgrade (`auto` with the sandbox disabled) or sets `sandbox.mode: "host"`, arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user, flagged as a **[security downgrade]** / red warning; docker mode is not perfect isolation either (shared host kernel, image must be trusted).
 - Review completeness is fail-closed by default: truncated review input or a lockfile sent only as a digest makes `success` false and routes to the human gate; `allowTruncatedReview: true` explicitly lets it pass (**lowers the security guarantee**; message/files/logs are flagged).
 - Sensitive files (`.env`, `*.pem`, `*.key`, `credentials*`, `secrets*`, `id_rsa*` etc.) are not sent to model review by default (their content is not sent to the model), but they are still delivered and kept in the `files` manifest; the message lists them and they must be reviewed manually.
+- **Secret controls, three layers**: sensitive files are not sent to model review, writer-output credentials are scanned (a hit rejects that round), and runner output is redacted (`[REDACTED:<category>]`).
 - Run in a disposable or dedicated environment under a least-privilege account, and always keep the human gate.
 
 See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and disclaimer.
@@ -185,7 +192,8 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 | `plugin.ts` | DSH Host half: tool registration, child presets, runtime tool isolation, model resolution, workspace gate |
 | `index.ts` | Orchestrator: rounds, baseline merge, runner dispatch, verdict, human gate |
 | `sandbox.ts` | Sandbox policy: host (default)/auto/docker decision, container args, Docker detection, auto-downgrade consent request |
-| `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
+| `secrets.ts` | Shared secret patterns: writer-output scanning and runner-output redaction |
+| `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation and secret redaction |
 | `state_manager.ts` | State: atomic writes, SHA-256 verification, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |
 | `cordis.patch.yml` / `locale/` / `icon.png` | Plugin manifest and display resources |
