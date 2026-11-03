@@ -48,13 +48,13 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ## 安装
 
-> **前置要求（DSH 宿主环境）**：宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。如果宿主版本过旧，DACW 会触发 Fail-Closed 拒绝运行，以保证隔离的安全底线：子代理必须运行在零工具 preset 上且隔离必须可验证；此外 sandbox 模式（`docker` / `auto`）无法提供容器时同样拒绝执行测试（fail-closed），不会静默回退到宿主执行。
+> **前置要求（DSH 宿主环境）**：宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。插件激活时会先探测所需宿主能力（`ctx.tools.register`、按配置条件要求的 `ctx.tools.restrict`、`agentPresets.register`、`subagents.getProvider/startActivation`、已注册的 `spawn` provider），缺失即在激活阶段报「宿主不兼容」并拒绝激活。如果宿主版本过旧，DACW 会触发 Fail-Closed 拒绝运行，以保证隔离的安全底线：子代理必须运行在零工具 preset 上且隔离必须可验证；此外 sandbox 模式（`docker` / `auto`）无法提供容器时同样拒绝执行测试（fail-closed），不会静默回退到宿主执行。
 
 前置：DSH 提供 `ctx.subagents`、`agentPresets` 服务与 `spawn` provider（`@deepseek-ai/dsh-subagent-spawn-in-process`）；构建需要 Node ≥ 22.13；测试默认在宿主直执（无隔离，需可用的 npm / pytest 等工具链），如需容器隔离请安装 Docker 并设置 `sandbox.mode: "docker"`/`"auto"`（sandbox 分支）；被测试项目的依赖需人工预装。
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 119 项回归自测
+node selftest.mjs                           # 120 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 

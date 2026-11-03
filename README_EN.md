@@ -48,13 +48,13 @@ Writer (JSON changeset) → Orchestrator (validate / merge / write) → Runner (
 
 ## Install
 
-> **Prerequisite (DSH host environment)**: the host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). On an older host DACW fails closed and refuses to run, preserving the isolation safety floor: subagents must run on zero-tool presets and isolation must be verifiable; in addition, when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused as well (fail-closed) — there is no silent fallback to host execution.
+> **Prerequisite (DSH host environment)**: the host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). At activation DACW probes the required host capabilities (`ctx.tools.register`, `ctx.tools.restrict` when required by config, `agentPresets.register`, `subagents.getProvider/startActivation`, and a registered `spawn` provider) and refuses to activate with a "host incompatible" error when any is missing. On an older host DACW fails closed and refuses to run, preserving the isolation safety floor: subagents must run on zero-tool presets and isolation must be verifiable; in addition, when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused as well (fail-closed) — there is no silent fallback to host execution.
 
 Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` provider (`@deepseek-ai/dsh-subagent-spawn-in-process`); Node ≥ 22.13 for the build; tests run on the host by default (no isolation, requires a working npm / pytest toolchain) — for container isolation install Docker and set `sandbox.mode: "docker"`/`"auto"` (sandbox branch); the tested project's dependencies must be installed manually.
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 119 regression vectors
+node selftest.mjs                           # 120 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 

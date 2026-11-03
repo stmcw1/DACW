@@ -900,8 +900,56 @@ const TOOL_DESCRIPTION =
     '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。' +
     '结果含 task_id 与 rollback_available；需要撤销本次任务时用 dacw_rollback（人工触发，回滚后任务终止）。';
 
+// ================= 宿主兼容性探测（apply 开始时 fail-fast）=================
+/**
+ * 探测插件实际依赖的宿主能力；缺失时抛错拒绝激活（不带病激活到工具调用时才炸）。
+ * 探测路径与实际调用保持一致（见 runSubagentChat 与 agent/created 隔离逻辑）。
+ * 注意：DSH 0.2.1-rc.5 的子代理激活入口是 `ctx.subagents.startActivation(spec)`；
+ * provider（如 spawn）对象只有 name/capabilities/prepareContinuable，**没有** startActivation。
+ */
+function hostIncompatible(capability: string, detail?: string): Error {
+    const reason = detail
+        ? `（${detail}；DSH 版本可能低于 0.2.1-rc.5 或 API 已变更）`
+        : '（DSH 版本可能低于 0.2.1-rc.5 或 API 已变更）';
+    return new Error(`[DACW] 宿主不兼容：缺少 ${capability}${reason}。\n请确认 DSH 版本，或联系插件维护者。`);
+}
+
+function assertHostCompatibility(ctx: any, config: PluginConfig): void {
+    const tools: any = (() => { try { return ctx && ctx.tools; } catch { return undefined; } })();
+    if (!tools || typeof tools.register !== 'function') {
+        throw hostIncompatible('ctx.tools.register');
+    }
+    // 条件性必需：关闭子代理工具隔离时，restrict 不是插件激活的前提。
+    if (config.enforceChildToolIsolation && typeof tools.restrict !== 'function') {
+        throw hostIncompatible('ctx.tools.restrict', 'config.enforceChildToolIsolation=true 时必需');
+    }
+    const getService = (name: string): any => {
+        try { return ctx && typeof ctx.get === 'function' ? ctx.get(name) : undefined; } catch { return undefined; }
+    };
+    const agentPresets = getService('agentPresets');
+    if (!agentPresets || typeof agentPresets.register !== 'function') {
+        throw hostIncompatible("ctx.get('agentPresets').register");
+    }
+    const subagents = getService('subagents');
+    if (!subagents || typeof subagents.getProvider !== 'function') {
+        throw hostIncompatible("ctx.get('subagents').getProvider");
+    }
+    if (typeof subagents.startActivation !== 'function') {
+        throw hostIncompatible("ctx.get('subagents').startActivation");
+    }
+    // provider 必须已注册（默认 spawn，取自 config.subagentProvider）：否则工作流无法启动子代理。
+    const providerName = String(config.subagentProvider || 'spawn');
+    let provider: any;
+    try { provider = subagents.getProvider(providerName); } catch { provider = undefined; }
+    if (!provider || typeof provider !== 'object') {
+        throw hostIncompatible(`subagent provider "${providerName}"`, 'getProvider 未返回对象');
+    }
+}
+
 export function apply(ctx: any, rawConfig?: unknown) {
     const { config, warnings, sandboxExplicit } = normalizePluginConfig(rawConfig);
+    // apply() 开头、任何 ctx.effect 之前：宿主不兼容直接拒绝激活。
+    assertHostCompatibility(ctx, config);
     const logger = makeLogger(ctx);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
 

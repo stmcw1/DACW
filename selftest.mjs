@@ -1147,18 +1147,72 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.match(rejected.message, /状态文件校验失败/);
     });
     // ---- 工具层（plugin.apply）：dacw_rollback 注册 + 参数校验 + workspace 解析一致性 ----
+    const makeDefaultHostServices = () => ({
+        agentPresets: { register: async () => () => {} },
+        subagents: {
+            getProvider: (name) => ({ name, capabilities: { agentPreset: true } }),
+            startActivation: async () => ({ childId: 'selftest-child', dispose: async () => {} }),
+        },
+    });
     const makePluginHarness = (rawConfig, services = {}) => {
         const tools = [];
         const disposers = [];
+        const mergedServices = { ...makeDefaultHostServices(), ...services };
         const ctx = {
             effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
             on: () => () => {},
-            get: (name) => services[name],
-            tools: { register: (definition) => { tools.push(definition); return () => {}; } },
+            get: (name) => mergedServices[name],
+            tools: {
+                register: (definition) => { tools.push(definition); return () => {}; },
+                restrict: () => () => {},
+            },
         };
         applyPlugin(ctx, rawConfig);
-        return { tools, find: (name) => tools.find((tool) => tool.name === name), disposers, services };
+        return { tools, find: (name) => tools.find((tool) => tool.name === name), disposers, services: mergedServices };
     };
+    await ta('宿主兼容性探测：缺失能力 fail-fast；tools.restrict 按 enforceChildToolIsolation 条件必需', async () => {
+        const makeCtx = (tools, services) => ({
+            effect: () => {},
+            on: () => () => {},
+            get: (name) => services[name],
+            tools,
+        });
+        const goodTools = { register: () => () => {}, restrict: () => () => {} };
+        const assertMissing = (ctx, rawConfig, pattern) => {
+            assert.throws(() => applyPlugin(ctx, rawConfig), (error) => {
+                assert.match(error.message, pattern);
+                assert.match(error.message, /DSH 版本可能低于 0\.2\.1-rc\.5 或 API 已变更/);
+                assert.match(error.message, /请确认 DSH 版本，或联系插件维护者/);
+                return true;
+            });
+        };
+        // 1) 缺少 ctx.tools.register
+        assertMissing(makeCtx(undefined, makeDefaultHostServices()), {}, /宿主不兼容：缺少 ctx\.tools\.register/);
+        // 2) 默认 enforceChildToolIsolation=true 时缺少 ctx.tools.restrict
+        assertMissing(makeCtx({ register: () => () => {} }, makeDefaultHostServices()), {}, /宿主不兼容：缺少 ctx\.tools\.restrict/);
+        // 3) 条件性：显式关闭隔离后，同一 ctx 不再要求 restrict → 激活成功
+        assert.doesNotThrow(() => applyPlugin(
+            makeCtx({ register: () => () => {} }, makeDefaultHostServices()),
+            { enforceChildToolIsolation: false, allowInheritedPresets: true }));
+        // 4) 缺少 agentPresets.register
+        assertMissing(makeCtx(goodTools, {
+            subagents: makeDefaultHostServices().subagents,
+        }), {}, /宿主不兼容：缺少 ctx\.get\('agentPresets'\)\.register/);
+        // 5) 缺少 subagents.getProvider
+        assertMissing(makeCtx(goodTools, {
+            agentPresets: makeDefaultHostServices().agentPresets,
+        }), {}, /宿主不兼容：缺少 ctx\.get\('subagents'\)\.getProvider/);
+        // 6) 缺少 subagents.startActivation（DSH 实际激活入口）
+        assertMissing(makeCtx(goodTools, {
+            agentPresets: makeDefaultHostServices().agentPresets,
+            subagents: { getProvider: () => ({ name: 'spawn' }) },
+        }), {}, /宿主不兼容：缺少 ctx\.get\('subagents'\)\.startActivation/);
+        // 7) provider 未注册（getProvider 返回 undefined）
+        assertMissing(makeCtx(goodTools, {
+            agentPresets: makeDefaultHostServices().agentPresets,
+            subagents: { getProvider: () => undefined, startActivation: async () => ({}) },
+        }), {}, /宿主不兼容：缺少 subagent provider "spawn"/);
+    });
     await ta('工具层：dacw_run 结果含 task_id/rollback_available；dacw_rollback git 模式端到端', async () => {
         const baseDir = path.join(tmpRoot, 'tool-git-base');
         const wsRaw = path.join(baseDir, 'ws');
