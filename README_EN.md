@@ -48,9 +48,13 @@ Writer (JSON changeset) → Orchestrator (validate / merge / write) → Runner (
 
 ## Install
 
-> **Prerequisite (DSH host environment)**: the host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). At activation DACW probes the required host capabilities (`ctx.tools.register`, `ctx.tools.restrict` when required by config, `agentPresets.register`, `subagents.getProvider/startActivation`) and refuses to activate with a "host incompatible" error when any is missing; an unregistered `spawn` provider only logs a warning (possibly a load-order issue) and is checked again — and refused — at `dacw_run` time. On an older host DACW fails closed and refuses to run, preserving the isolation safety floor: subagents must run on zero-tool presets and isolation must be verifiable; in addition, when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused as well (fail-closed) — there is no silent fallback to host execution.
+> **Prerequisite (DSH host environment)**: **DSH ≥ 0.2.1-rc.5 (current tested version)**. The host must provide the `agentPresets` and `subagents` services (`ctx.subagents` / `agentPresets`; a recent DSH release is recommended). At activation DACW probes the required host capabilities (`ctx.tools.register`, `ctx.tools.restrict` when required by config, `agentPresets.register`, `subagents.getProvider/startActivation`) and refuses to activate with a "host incompatible" error when any is missing; an unregistered `spawn` provider only logs a warning (possibly a load-order issue) and is checked again — and refused — at `dacw_run` time. On an older host DACW fails closed and refuses to run, preserving the isolation safety floor: subagents must run on zero-tool presets and isolation must be verifiable; in addition, when sandbox mode (`docker` / `auto`) cannot provide a container, tests are refused as well (fail-closed) — there is no silent fallback to host execution.
 
-Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` provider (`@deepseek-ai/dsh-subagent-spawn-in-process`); Node ≥ 22.13 for the build; tests run on the host by default (no isolation, requires a working npm / pytest toolchain) — for container isolation install Docker and set `sandbox.mode: "docker"`/`"auto"` (sandbox branch); the tested project's dependencies must be installed manually.
+Dependencies: DACW relies on the DSH host services `ctx.subagents`, `agentPresets` and `tools`, plus DSH's official `dsh-persona` and `dsh-subagent-spawn-in-process`. No third-party or community plugins are required.
+
+State verification uses deterministic SHA-256 by default (guards against accidental corruption; not against recomputation by a same-account local user); callers that need stronger tamper resistance can inject a custom checksum function (programmatic integration).
+
+Build requires Node ≥ 22.13; tests run on the host by default (no isolation, requires a working npm / pytest toolchain) — for container isolation install Docker and set `sandbox.mode: "docker"`/`"auto"`; the tested project's dependencies must be installed manually.
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
@@ -144,6 +148,18 @@ config:
 ```
 
 Resolution happens at the start of every tool call, so DSH settings changes apply immediately; a resolution failure fails closed and never silently switches models.
+
+### Optional: local models
+
+If you have a local model environment or compliance requirements, connect Ollama / LM Studio / vLLM through DSH's Custom model API (`@deepseek-ai/dsh-llm-pi-ai`). On the DACW side you only need to set `writerModel` / `reviewerModel` in `provider/model` form:
+
+```yaml
+config:
+  writerModel: ollama/qwen2.5-coder
+  reviewerModel: lmstudio/local-model
+```
+
+DACW does not distinguish model sources — its defenses work the same way. Note: local small models are weaker than cloud models, so DACW will fail closed to the human gate more often — expected behavior, not a malfunction. If DSH's `listModels` returns empty, use the explicit `provider/model` form.
 
 ## Safety
 

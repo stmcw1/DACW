@@ -48,9 +48,13 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ## 安装
 
-> **前置要求（DSH 宿主环境）**：宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。插件激活时会先探测所需宿主能力（`ctx.tools.register`、按配置条件要求的 `ctx.tools.restrict`、`agentPresets.register`、`subagents.getProvider/startActivation`），缺失即在激活阶段报「宿主不兼容」并拒绝激活；`spawn` provider 未注册仅告警（可能是加载顺序问题），会在 `dacw_run` 调用时再次检查并拒绝。如果宿主版本过旧，DACW 会触发 Fail-Closed 拒绝运行，以保证隔离的安全底线：子代理必须运行在零工具 preset 上且隔离必须可验证；此外 sandbox 模式（`docker` / `auto`）无法提供容器时同样拒绝执行测试（fail-closed），不会静默回退到宿主执行。
+> **前置要求（DSH 宿主环境）**：**DSH ≥ 0.2.1-rc.5（当前实测版本）**。宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。DACW 在激活时探测宿主能力（`ctx.tools.register`、按配置条件要求的 `ctx.tools.restrict`、`agentPresets.register`、`subagents.getProvider/startActivation`），缺失即报「宿主不兼容」并拒绝激活；`spawn` provider 注册仅告警（可能是加载顺序问题），在 `dacw_run` 调用时再次检查并拒绝。如果宿主版本过旧，DACW 会触发 Fail-Closed 拒绝运行，以保证隔离的安全底线：子代理必须运行在零工具 preset 上且隔离必须可验证；此外 sandbox 模式（`docker` / `auto`）无法提供容器时同样拒绝执行测试（fail-closed），不会静默回退到宿主执行。
 
-前置：DSH 提供 `ctx.subagents`、`agentPresets` 服务与 `spawn` provider（`@deepseek-ai/dsh-subagent-spawn-in-process`）；构建需要 Node ≥ 22.13；测试默认在宿主直执（无隔离，需可用的 npm / pytest 等工具链），如需容器隔离请安装 Docker 并设置 `sandbox.mode: "docker"`/`"auto"`（sandbox 分支）；被测试项目的依赖需人工预装。
+依赖说明：DACW 依赖 DSH 宿主提供的 `ctx.subagents`、`agentPresets`、`tools` 服务，以及 DSH 官方的 `dsh-persona`、`dsh-subagent-spawn-in-process`。不依赖第三方或社区插件。
+
+状态校验默认确定性 SHA-256（防意外损坏，不防同账号本地用户重算）；需要更强防篡改可注入自定义校验函数（编程调用方）。
+
+构建需要 Node ≥ 22.13；测试默认在宿主直执（无隔离，需可用的 npm / pytest 等工具链），如需容器隔离请安装 Docker 并设置 `sandbox.mode: "docker"`/`"auto"`；被测试项目的依赖需人工预装。
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
@@ -144,6 +148,18 @@ config:
 ```
 
 解析发生在每次工具调用开始时，DSH 设置变更即时生效；解析失败即 fail-closed，不会静默换用其他模型。
+
+### 可选接入：本地模型
+
+如你有本地模型环境或合规要求，可通过 DSH 的 Custom model API（`@deepseek-ai/dsh-llm-pi-ai`）接入 Ollama / LM Studio / vLLM。DACW 侧只需将 `writerModel` / `reviewerModel` 设为 `provider/model` 形式：
+
+```yaml
+config:
+  writerModel: ollama/qwen2.5-coder
+  reviewerModel: lmstudio/local-model
+```
+
+DACW 不区分模型来源，防御机制一视同仁。注意：本地小模型能力弱于云端，DACW 会更频繁 fail-closed 转人工——这是预期行为，不是故障。如 DSH 的 `listModels` 返回空，请使用 `provider/model` 显式形式。
 
 ## 安全
 

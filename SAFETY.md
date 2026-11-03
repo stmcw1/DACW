@@ -61,6 +61,7 @@ docker 模式的容器约束：`--network none`（无网络）、只读根文件
 - 写手/审查者是真实的子代理会话（可在 profile 中查看）；显式配置模型时，任务描述与工作区代码会发送给所选模型提供方。
 - 工作区每轮被重置为非地基文件集，这是设计上的破坏性行为；`workspacePolicy: "allow"` 会跳过空目录/标记检查。
 - 状态文件默认落在 `os.tmpdir()/dacw-state`，包含任务描述、测试输出与审查文本，不自动清理、不做崩溃恢复。
+- **审计证据的局限：** 本地日志可被本地用户修改，不构成防篡改证据；状态文件（含 `secretScanHits`、`reviewExcluded`、`rollback` 等审计字段）使用确定性 SHA-256 校验，防意外损坏，不防同账号本地用户重算。需要对抗性证据时，应导出并外部存证。
 - 子代理工具隔离依赖宿主的 `ctx.tools.restrict` 与 `agent/created` 事件；隔离失败或 preset 注册失败时默认拒绝运行。**无法确认隔离同样是失败**：provider 未返回有效 childId、子代理上下文缺少 `tools.schemas` 等验证能力时，调用被终止且不记为成功。唯一逃生门是显式设置 `enforceChildToolIsolation=false`（接受子代理可能继承宿主工具的风险）；`allowInheritedPresets` 仅在关闭隔离要求后才作为配套选项才有意义。
 - 被测试项目的依赖需人工预装，`node_modules` 被视为可信基座；测试进程可以读写它们，host 模式下尤其如此。
 - 审查者模型可能被工作区注入的指令劫持，格式合法的伪造 PASS 仍可能出现——**人工闸门是最终兜底**。
