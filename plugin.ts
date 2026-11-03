@@ -886,7 +886,8 @@ const ROLLBACK_TOOL_DESCRIPTION =
     '回滚 DACW 任务到任务开始前。git 工作区返回回滚指令（DACW 不执行 git 命令）；' +
     '非 git 工作区从备份恢复。回滚需人工触发，执行前会通过宿主 userQuestions 请求人类确认；' +
     '宿主无交互能力且未显式设置 DACW_ROLLBACK_TOKEN 时拒绝执行（fail-closed），回滚后任务终止。' +
-    '必须与执行该任务的同一个 DACW 插件实例/状态配置一起使用（状态文件按 task_id + 工作区路径定位）。';
+    '必须与执行该任务的同一个 DACW 插件实例/状态配置一起使用'
+    + '（状态文件按 task_id + 工作区路径定位；编程调用方若注入自定义 stateChecksumFn，回滚必须使用同一函数）。';
 
 const ROLLBACK_TOKEN_ENV = 'DACW_ROLLBACK_TOKEN';
 
