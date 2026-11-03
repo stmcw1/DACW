@@ -9,6 +9,19 @@ import * as crypto from 'crypto';
 
 export type WorkflowStatus = 'IDLE' | 'RUNNING' | 'NEED_HUMAN' | 'DONE';
 
+/** 回滚点类型：git＝任务开始前的 HEAD commit；workspace＝备份目录名。 */
+export type RollbackPointMode = 'git' | 'workspace';
+
+/** 任务开始前捕获的回滚点（用于“一键回滚”）。 */
+export interface RollbackPoint {
+    /** git：任务开始前的 HEAD commit；workspace：备份目录名。 */
+    mode: RollbackPointMode;
+    /** git 为 commit hash；workspace 为 stateDir/backup/<taskId> 下的备份目录名。 */
+    ref: string;
+    /** 捕获时间（ISO 8601）。 */
+    capturedAt: string;
+}
+
 
 export interface WorkflowState {
     taskId: string;
@@ -22,6 +35,8 @@ export interface WorkflowState {
     reviewExcluded: string[] | null;
     /** 写手输出秘密扫描命中记录（"文件:类别"，不含原文）；null 表示未命中或未启用扫描。 */
     secretScanHits: string[] | null;
+    /** 任务开始前捕获的回滚点；null 表示未捕获（例如非 git 工作区且备份失败）。 */
+    rollbackPoint: RollbackPoint | null;
     lastError: string | null;      
 }
 
@@ -36,6 +51,7 @@ interface PersistedState {
     reviewResult: string | null;
     reviewExcluded: string[] | null;
     secretScanHits: string[] | null;
+    rollbackPoint: RollbackPoint | null;
     lastError: string | null;
     checksum: string;
 }
@@ -83,11 +99,12 @@ export class StateManager {
     }
 
     private checksumOf(state: WorkflowState): string {
-        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, lastError } = state;
+        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, rollbackPoint, lastError } = state;
         const body = JSON.stringify({
             taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
             reviewExcluded: reviewExcluded ?? null,
             secretScanHits: secretScanHits ?? null,
+            rollbackPoint: rollbackPoint ?? null,
             lastError,
         });
         return this.macOf(body);
@@ -155,7 +172,7 @@ export class StateManager {
             const initial: WorkflowState = {
                 taskId: this.taskId, round: 1, status: 'RUNNING', taskPrompt,
                 writtenFiles: null, testResult: null, reviewResult: null,
-                reviewExcluded: null, secretScanHits: null, lastError: null
+                reviewExcluded: null, secretScanHits: null, rollbackPoint: null, lastError: null
             };
             await this.persist(initial);
             this.authoritative = initial;
