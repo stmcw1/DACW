@@ -201,7 +201,7 @@ DACW 会执行模型生成的代码与命令。**测试在审查之前执行**�
 
 ## 状态
 
-实验性开发者预览（当前版本 `v1.1.0`，bundle `@stmcw1/dacw`）：构建冒烟与回归自测通过。默认执行策略为宿主直执（`sandbox.mode: "host"`，无隔离）；一次性容器执行（`docker`/`auto`）在 sandbox 分支开发。v1.0.2 在 DSH `desktop` profile 的宿主执行闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`，子代理工具隔离实测生效）在默认配置下仍然成立。欢迎 issue / PR。
+实验性开发者预览（当前版本 `v1.1.0`，bundle `@stmcw1/dacw`）：构建冒烟与 128 项回归自测通过。默认执行策略为宿主直执（`sandbox.mode: "host"`，无隔离）；`auto`/`docker` 为显式可选（Docker 不可用时 fail-closed / 交互确认，见「沙箱配置」）。**宿主执行闭环验证状态：** v1.0.2 曾在 DSH `desktop` profile 完成闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`，子代理工具隔离实测生效）；v1.1.0 改动了默认执行策略、回滚授权、秘密管控、测试后对账与宿主能力探测，**尚未在 v1.1.0 上重跑该闭环验证**，因此不能沿用 v1.0.2 的结论；待重新验证通过后更新本节。欢迎 issue / PR。
 
 ## 许可证
 

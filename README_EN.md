@@ -199,7 +199,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 
 ## Status
 
-Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and regression self-test pass. The default execution policy is host (no isolation); one-shot container execution (`docker`/`auto`) is developed on the sandbox branch. The v1.0.2 live host-execution loop verified on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`, child tool isolation measured in effect) still holds under the default configuration. Issues and PRs are welcome.
+Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and 128 regression vectors pass. The default execution policy is host (no isolation); `auto`/`docker` are explicit opt-ins (fail-closed / interactive confirmation when Docker is unavailable — see "Sandbox configuration"). **Live host-execution loop status:** v1.0.2 completed the closed-loop verification on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`, child tool isolation measured in effect); v1.1.0 changed the default execution policy, rollback authorization, secret controls, post-test reconciliation and host capability probe, and the loop **has not been re-run on v1.1.0 yet** — the v1.0.2 conclusion does not carry over; this section will be updated once re-verification passes. Issues and PRs are welcome.
 
 ## License
 
