@@ -1303,7 +1303,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const rendered = runTool.output.render([], sample)[0].text;
         assert.match(rendered, new RegExp(`回滚：可用（task_id: ${taskId}`));
         // 回滚工具端到端（workspace 相对 baseDir 解析，必须与建状态时一致）
-        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } });
         eq(value.success, true);
         eq(value.mode, 'git-hint');
         eq(value.task_id, taskId);
@@ -1335,7 +1335,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             workingDirectory: { ensure: async () => baseDir },
         });
         const rollbackTool = harness.find('dacw_rollback');
-        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } });
         eq(value.success, true);
         eq(value.mode, 'workspace-restore');
         eq(value.record.executed, true);
@@ -1360,15 +1360,15 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const rollbackTool = harness.find('dacw_rollback');
         await assert.rejects(() => rollbackTool.execute({}, { agent: { id: 'lead-agent' } }), /task_id 必须是非空字符串/);
         await assert.rejects(
-            () => rollbackTool.execute({ task_id: 't', reason: 'x'.repeat(501) }, { agent: { id: 'lead-agent' } }),
+            () => rollbackTool.execute({ task_id: 't', reason: 'x'.repeat(501), confirm: true }, { agent: { id: 'lead-agent' } }),
             /reason 过长/);
         await assert.rejects(
-            () => rollbackTool.execute({ task_id: 't' }, { agent: null }),
+            () => rollbackTool.execute({ task_id: 't', confirm: true }, { agent: null }),
             /只能由 Agent 调用/);
         // 不存在的 task_id → 抛错（不伪装成功），错误对象携带 dacwRollback
         let failure = null;
         try {
-            await rollbackTool.execute({ task_id: 'no-such-task', workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+            await rollbackTool.execute({ task_id: 'no-such-task', workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } });
         } catch (error) {
             failure = error;
         }
@@ -1382,7 +1382,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         await fs.mkdir(other, { recursive: true });
         await fs.writeFile(path.join(other, 'foreign.txt'), 'x\n', 'utf8');
         await assert.rejects(
-            () => rollbackTool.execute({ task_id: 'x', workspace: 'other' }, { agent: { id: 'lead-agent' } }),
+            () => rollbackTool.execute({ task_id: 'x', workspace: 'other', confirm: true }, { agent: { id: 'lead-agent' } }),
             /安全拦截/);
     });
     await ta('B6-1 回滚确认：ask 返回无 answers/无 selected → fail-closed，工作区不变、rollback 未写入', async () => {
@@ -1394,7 +1394,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         });
         const rollbackTool = harness.find('dacw_rollback');
         await assert.rejects(
-            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } }),
             /用户未确认回滚/);
         const digestAfter = await enumerateWorkspace(fixture.wsDir);
         eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
@@ -1410,7 +1410,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         }, { userQuestions: 'cancel' });
         const rollbackTool = harness.find('dacw_rollback');
         await assert.rejects(
-            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } }),
             /用户未确认回滚/);
         const digestAfter = await enumerateWorkspace(fixture.wsDir);
         eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
@@ -1427,7 +1427,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             }, { userQuestions: 'missing' });
             const rollbackTool = harness.find('dacw_rollback');
             await assert.rejects(
-                () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+                () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } }),
                 /未设置 DACW_ROLLBACK_TOKEN/);
             const digestAfter = await enumerateWorkspace(fixture.wsDir);
             eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
@@ -1451,7 +1451,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const rollbackTool = harness.find('dacw_rollback');
         const agent = { id: 'lead-agent' };
         const controller = new AbortController();
-        const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent, signal: controller.signal });
+        const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws', confirm: true }, { agent, signal: controller.signal });
         eq(value.success, true);
         eq(value.mode, 'workspace-restore');
         assert.ok(captured, '应捕获交互请求');
@@ -1478,7 +1478,7 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
                 workingDirectory: { ensure: async () => fixture.baseDir },
             }, { userQuestions: 'missing' });
             const rollbackTool = harness.find('dacw_rollback');
-            const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+            const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws', confirm: true }, { agent: { id: 'lead-agent' } });
             eq(value.success, true);
             eq(value.mode, 'workspace-restore');
             eq(value.record.executed, true);
@@ -1491,6 +1491,61 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             if (prevToken === undefined) delete process.env.DACW_ROLLBACK_TOKEN;
             else process.env.DACW_ROLLBACK_TOKEN = prevToken;
         }
+    });
+    await ta('C6-A dacw_rollback：缺 confirm 被拒，不触碰工作区、无 rollback 记录', async () => {
+        const fixture = await makeRollbackFixture('confirm-required');
+        const digestBefore = await enumerateWorkspace(fixture.wsDir);
+        const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => fixture.baseDir },
+        });
+        const rollbackTool = harness.find('dacw_rollback');
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: fixture.taskId }, { agent: { id: 'lead-agent' } }),
+            (error) => {
+                assert.match(error.message, /请传 confirm: true/);
+                assert.match(error.message, /git 工作区/);
+                assert.match(error.message, /DACW_ROLLBACK_TOKEN/);
+                return true;
+            });
+        const digestAfter = await enumerateWorkspace(fixture.wsDir);
+        eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
+        eq((await fixture.readState()).rollback, null);
+    });
+    await ta('C6-B dacw_rollback：confirm 非字面量 true 一律被拒（最后防线）', async () => {
+        const harness = makePluginHarness({}, {});
+        const rollbackTool = harness.find('dacw_rollback');
+        const exec = { agent: { id: 'lead-agent' } };
+        for (const bad of [false, 'true', 1, {}, null, undefined]) {
+            await assert.rejects(
+                () => rollbackTool.execute({ task_id: 'some-task', confirm: bad }, exec),
+                /请传 confirm: true/,
+                `confirm=${String(bad)} 应被拒绝`);
+        }
+    });
+    await ta('C6-C dacw_run：captureRollbackPoint 失败时 rollback_available=false', async () => {
+        const baseDir = path.join(tmpRoot, 'c6-availability');
+        const wsRaw = path.join(baseDir, 'ws');
+        await fs.mkdir(wsRaw, { recursive: true });
+        const wsDir = await fs.realpath(wsRaw);
+        const stateDirInside = path.join(wsDir, '.state');
+        const harness = makePluginHarness({
+            stateDir: stateDirInside, workspace: '', allowInheritedPresets: true,
+        }, {
+            workingDirectory: { ensure: async () => baseDir },
+        });
+        const dacwRunTool = harness.find('dacw_run');
+        assert.ok(dacwRunTool, 'dacw_run 应已注册');
+        let failure = null;
+        try {
+            await dacwRunTool.execute({ task: 'selftest', workspace: wsDir }, { agent: { id: 'lead-agent' } });
+        } catch (error) {
+            failure = error;
+        }
+        assert.ok(failure, '应抛错');
+        assert.ok(failure.dacw, '错误对象应含 .dacw');
+        assert.equal(failure.dacw.success, false);
+        assert.equal(failure.dacw.rollback_available, false, '回滚点未捕获时 rollback_available 应为 false');
+        assert.match(failure.message, /回滚点|stateDir/);
     });
     await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
         const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(
