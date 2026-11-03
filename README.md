@@ -4,6 +4,7 @@
   </a>
   <p><i> 点击 or click</i></p>
 </div>
+
 <div align="center">
 
 # DACW — 防御性智能体编程工作流
@@ -20,12 +21,16 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 - **三权分立**：写手只产出 JSON 变更集，运行机只执行白名单命令，审查者只输出裁决——没有任何一方能独立合入代码。
 - **子代理零工具隔离**：写手/审查者运行在 persona-only preset 上，插件在 `agent/created` 阶段用 `ctx.tools.restrict({ allow: [] })` 剥除全部继承工具并校验可见工具为 0；隔离失败则拒绝创建子代理。
+- **独立工作区（仅版本控制隔离，测试执行仍在宿主权限下）**：DACW 只在你指定的专用目录内读写与重置文件，不触碰主分支或其他目录；这属于版本控制层面的隔离，测试命令仍以宿主用户权限执行。
+- **执行隔离默认关闭（host）**：`sandbox.mode` 默认 `"host"`——测试在宿主用户权限下运行写手产出的代码（无容器隔离）。可显式配置 `"auto"`：Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止）。
 - **输出协议 v2**：写手只输出相对基线的变更，未提及文件逐字节保留，明显减少 token，并避免"上轮通过的代码被改坏"。
-- **确定性运行机**：命令白名单（npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go）、环境变量白名单、超时强杀进程树、输出截断。
+- **确定性运行机**：命令白名单（npm / pnpm / yarn / npx / node / python / python3 / pytest / cargo / go）、环境变量白名单、超时强杀、输出截断。
 - **结构化审查**：裁决必须为精确 JSON，解析失败按 REJECTED 处理；PASS 但含可疑字样 → 人工闸门。
 - **可配置模型**：写手/审查者可分别继承父会话路由，或从 DSH 已配置模型目录中选择；启动日志与结果对象显示实际生效的模型。
 - **工作区安全闸门**：仅接受空目录或本插件写入的合法 `.dacw-workspace` 标记；拒绝系统根、用户主目录、`DSH_HOME`/profile 目录；写入前做 realpath + 逐段符号链接校验。
-- **审计记录**：状态文件包含任务、文件清单摘要、测试输出与审查文本，HMAC-SHA256 签名。
+- **审计记录**：状态文件包含任务、文件清单摘要、测试输出与审查文本，SHA-256 校验（防意外损坏/手滑改写；不防同账号本地用户重算，与审计日志边界一致）。
+
+> **信任边界**：测试在审查之前执行，审查是侦探性控制而非预防性控制；子代理工具隔离不是代码执行的安全边界。详见 [SAFETY.md](SAFETY.md)。
 
 ## 工作流程
 
@@ -37,19 +42,23 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 1. 写手按协议 v2 输出变更。
 2. 协调器做路径越权校验、合并基线并把工作区重置为合并集。
-3. 运行机按项目类型执行测试（每轮重新嗅探）。
+3. 运行机按项目类型执行测试（每轮重新嗅探）——**这是第一次执行写手产出的代码，发生在审查之前**。
 4. 审查者审计全量文件 + 地基文件（锁文件送 SHA256 摘要）。
 5. 通过后返回 `success: true`、`status: "NEED_HUMAN"`；其余路径同样收敛到人工闸门。
 
 ## 安装
 
-> **前置要求（DSH 宿主环境）**：宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。它们用于创建写手/审查者专用零工具 preset 并强制执行子代理工具隔离；**宿主版本过旧时 DACW 会触发 Fail-Closed 拒绝运行**（不会静默降级为继承父会话工具），以保证隔离的安全底线。
+> **前置要求（DSH 宿主环境）**：**DSH ≥ 0.2.1-rc.5（当前实测版本）**。宿主需支持 `agentPresets` 与 `subagents` 服务（`ctx.subagents` / `agentPresets`，建议使用最新版 DSH）。DACW 在激活时探测宿主能力（`ctx.tools.register`、按配置条件要求的 `ctx.tools.restrict`、`agentPresets.register`、`subagents.getProvider/startActivation`），缺失即报「宿主不兼容」并拒绝激活；`spawn` provider 注册仅告警（可能是加载顺序问题），在 `dacw_run` 调用时再次检查并拒绝。如果宿主版本过旧，DACW 会触发 Fail-Closed 拒绝运行，以保证隔离的安全底线：子代理必须运行在零工具 preset 上且隔离必须可验证；此外 sandbox 模式（`docker` / `auto`）无法提供容器时同样拒绝执行测试（fail-closed），不会静默回退到宿主执行。
 
-前置：DSH 提供 `ctx.subagents`、`agentPresets` 服务与 `spawn` provider（`@deepseek-ai/dsh-subagent-spawn-in-process`）；构建需要 Node ≥ 22.13；被测试项目的依赖需人工预装。
+依赖说明：DACW 依赖 DSH 宿主提供的 `ctx.subagents`、`agentPresets`、`tools` 服务，以及 DSH 官方的 `dsh-persona`、`dsh-subagent-spawn-in-process`。不依赖第三方或社区插件。
+
+状态校验默认确定性 SHA-256（防意外损坏，不防同账号本地用户重算）；需要更强防篡改可注入自定义校验函数（编程调用方）。
+
+构建需要 Node ≥ 22.13；测试默认在宿主直执（无隔离，需可用的 npm / pytest 等工具链），如需容器隔离请安装 Docker 并设置 `sandbox.mode: "docker"`/`"auto"`；被测试项目的依赖需人工预装。
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 60 项回归自测
+node selftest.mjs                           # 128 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
@@ -76,6 +85,7 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 | `workspace` / `files` / `round` | 工作区、产出文件、终止轮次 |
 | `models` | `{ writer, reviewer }`，实际生效的模型 |
 | `logs` / `elapsed_ms` | 日志尾部与耗时 |
+| `task_id` / `rollback_available` | 本次任务 ID（自动生成时也返回）与回滚是否可用 |
 
 启动日志示例：
 
@@ -84,6 +94,46 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
 工作流失败时工具抛出错误（附工作区、状态、轮次与日志尾部），不会把失败伪装成普通结果；所有路径都不提交、不合入。
+
+### 回滚（dacw_rollback）
+
+回滚是高影响操作。调用时工具会请求人类交互确认（DSH `userQuestions`）；
+宿主无交互能力时，需在 DSH 宿主环境设置 `DACW_ROLLBACK_TOKEN=<任意非空字符串>`，
+否则拒绝执行。
+
+- **git 工作区**：返回回滚指令（`git reset --hard <commit>`），不执行任何 git 命令，不修改文件。
+- **非 git 工作区**：从备份恢复。执行前必须通过交互确认或 token 授权。
+
+回滚后任务终止，工作区内容恢复到回滚点。
+
+## 沙箱配置
+
+测试执行位置由 `config.sandbox` 决定（**默认 `host`：执行隔离默认关闭，测试在宿主用户权限下运行**）。
+
+- 需要更强隔离时，可显式配置 `sandbox.mode: "auto"`：Docker 可用时在一次性容器内执行（无网络、只读根文件系统、非 root、cap-drop ALL、资源受限）；Docker 不可用时通过 DSH 交互确认询问是否降级——选择保持或无法确认即 fail-closed 停止（不会静默降级）。
+- 显式 `sandbox.mode: "docker"`：强制容器，Docker 不可用时拒绝运行（不询问、不降级）。
+- 显式 `mode: "host"` 时启动会有一条红色警告（默认值不告警）。
+
+> 交互确认文案（仅 `auto` 且 Docker 不可用时触发）：未检测到可用的沙盒隔离环境（如 Docker 未安装或未启动）。是否关闭沙盒模式并继续？
+
+| 模式 | 行为 |
+|---|---|
+| `host`（默认） | 宿主直执（无隔离）：执行隔离默认关闭，测试在宿主用户权限下运行 |
+| `auto` | Docker 可用 → 一次性容器；不可用 → 弹出确认，拒绝或无法确认则 fail-closed |
+| `docker` | 强制一次性容器；Docker 不可用 → 直接拒绝运行（不询问、不降级） |
+
+```yaml
+config:
+  sandbox:
+    mode: host                # host（默认）| auto | docker
+    image: ''                 # 空 = 按测试命令自动选择官方镜像；也可固定如 node:22-bookworm-slim
+    memoryMb: 1024
+    cpus: 1                   # 允许小数
+    pidsLimit: 256
+    tmpfsMb: 128
+```
+
+docker 模式（sandbox 分支）的容器约束：`--network none`（无网络）、只读根文件系统（仅 /tmp tmpfs 可写）、非 root（uid/gid 1000）、`--cap-drop ALL`、`no-new-privileges`、内存 / CPU / 进程数上限、`--rm` 一次性；工作区复制进一次性暂存目录后挂载，宿主工作区本身不进入容器。首次使用请先 `docker pull` 对应镜像（node 系默认 `node:22-bookworm-slim`，python 系 `python:3.12-slim`，cargo 系 `rust:1-slim`，go 系 `golang:1.23-bookworm`）。
 
 ## 模型配置
 
@@ -104,9 +154,31 @@ config:
 
 解析发生在每次工具调用开始时，DSH 设置变更即时生效；解析失败即 fail-closed，不会静默换用其他模型。
 
+### 可选接入：本地模型
+
+如你有本地模型环境或合规要求，可通过 DSH 的 Custom model API（`@deepseek-ai/dsh-llm-pi-ai`）接入 Ollama / LM Studio / vLLM。DACW 侧只需将 `writerModel` / `reviewerModel` 设为 `provider/model` 形式：
+
+```yaml
+config:
+  writerModel: ollama/qwen2.5-coder
+  reviewerModel: lmstudio/local-model
+```
+
+DACW 不区分模型来源，防御机制一视同仁。注意：本地小模型能力弱于云端，DACW 会更频繁 fail-closed 转人工——这是预期行为，不是故障。如 DSH 的 `listModels` 返回空，请使用 `provider/model` 显式形式。
+
 ## 安全
 
-DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请在专用或一次性环境、最小权限账号下使用，并始终保留人工终审。完整边界与免责声明见 [SAFETY.md](SAFETY.md)。
+执行隔离默认关闭：测试在宿主用户权限下运行；可显式启用 `sandbox.mode: "auto"` 在 Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止）。
+
+DACW 会执行模型生成的代码与命令。**测试在审查之前执行**，审查（含人工终审）是侦探性控制，不是执行前的安全屏障；子代理工具隔离不是代码执行的安全边界。
+
+- 默认 `sandbox.mode: "host"`：执行隔离默认关闭，测试在宿主用户权限下运行；可显式配置 `"auto"` 在 Docker 可用时容器化，不可用时交互询问是否降级（拒绝或无法确认则 fail-closed 停止，不会静默降级）。
+- 用户显式确认降级（`auto` 下选择关闭沙盒）或配置 `sandbox.mode: "host"` 时，写手产出的任意代码（含 `package.json` 的 test/pretest 脚本）将以宿主用户全权限运行，结果标注【安全降级】/红色警告；docker 模式也不是完美隔离（共享宿主内核、镜像需可信）。
+- 审查完整性默认 fail-closed：审查输入被字符上限截断、或锁文件只送 SHA256 摘要时，`success` 恒为 false 并转人工；`allowTruncatedReview: true` 可显式放行（**降低安全保证**，message/files/日志会标注）。
+- 敏感文件（`.env`、`*.pem`、`*.key`、`credentials*`、`secrets*`、`id_rsa*` 等）默认不送模型审查（内容不发给模型），但仍交付、保留在 `files` 清单中，message 会标注，需人工审阅。
+- 请在专用或一次性环境、最小权限账号下使用，并始终保留人工终审。
+
+完整边界、执行顺序与免责声明见 [SAFETY.md](SAFETY.md)。
 
 ## 项目结构
 
@@ -114,8 +186,9 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 |---|---|
 | `plugin.ts` | DSH Host 半边：工具注册、子代理 preset、运行时工具隔离、模型解析、工作区闸门 |
 | `index.ts` | 协调器：轮次、基线合并、运行机调度、裁决、人工闸门 |
+| `sandbox.ts` | 沙箱策略层：host（默认）/auto/docker 决策、容器参数、Docker 探测、auto 降级确认请求 |
 | `runner.ts` | 运行机：命令解析、超时强杀、输出截断 |
-| `state_manager.ts` | 状态：原子写、HMAC、串行队列 |
+| `state_manager.ts` | 状态：原子写、SHA-256 校验、串行队列 |
 | `build.mjs` / `selftest.mjs` | 构建（TS → `dist/`）与回归自测 |
 | `cordis.patch.yml` / `locale/` / `icon.png` | 插件清单与展示资源 |
 
@@ -123,12 +196,12 @@ DACW 会执行模型生成的代码与命令，**不是容器级沙箱**。请�
 
 - `dist/` 由 `build.mjs` 用 Node 内置类型擦除生成，不依赖 `typescript`，也不入库。
 - 提交前请执行 `node build.mjs && node selftest.mjs`。
-- 完整配置项与默认值见 `plugin.ts` 的 `DEFAULT_PLUGIN_CONFIG`（`cordis.patch.yml` 的 `config` 可逐项覆盖）。
+- 完整配置项与默认值见 `plugin.ts` 的 `DEFAULT_PLUGIN_CONFIG`（`cordis.patch.yml` 的 `config` 可逐项覆盖）；沙箱默认值见 `sandbox.ts` 的 `DEFAULT_SANDBOX_CONFIG`。
 - 实验性项目，接口与行为可能变化。
 
 ## 状态
 
-实验性开发者预览（当前版本 `v1.0.2`，bundle `@stmcw1/dacw`）：构建冒烟与回归自测通过，并已在 DSH `desktop` profile 完成真实闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`），子代理工具隔离实测生效。欢迎 issue / PR。
+实验性开发者预览（当前版本 `v1.1.0`，bundle `@stmcw1/dacw`）：构建冒烟与回归自测通过。默认执行策略为宿主直执（`sandbox.mode: "host"`，无隔离）；一次性容器执行（`docker`/`auto`）在 sandbox 分支开发。v1.0.2 在 DSH `desktop` profile 的宿主执行闭环验证（写手产出 → `npm test` 通过 → 独立审查 PASS → `NEED_HUMAN`，子代理工具隔离实测生效）在默认配置下仍然成立。欢迎 issue / PR。
 
 ## 许可证
 

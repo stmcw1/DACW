@@ -23,7 +23,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const outDir = path.join(root, 'dist');
 
 /** Runtime modules, in no particular order. */
-const SOURCES = ['index.ts', 'runner.ts', 'state_manager.ts', 'plugin.ts'];
+const SOURCES = ['index.ts', 'runner.ts', 'sandbox.ts', 'secrets.ts', 'state_manager.ts', 'plugin.ts'];
 
 const RELATIVE_IMPORT = /((?:from|import)\s*\(?\s*['"])(\.{1,2}\/[^'"]+?)(['"]\s*\)?)/g;
 
@@ -49,11 +49,19 @@ for (const file of SOURCES) {
 // plugin activation time inside the Harness.
 const engine = await import(pathToFileURL(path.join(outDir, 'index.js')));
 const plugin = await import(pathToFileURL(path.join(outDir, 'plugin.js')));
+const secrets = await import(pathToFileURL(path.join(outDir, 'secrets.js')));
 
-for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict']) {
+for (const name of ['scanWriterOutputForSecrets', 'redactSecretsInText']) {
+  if (typeof secrets[name] !== 'function') throw new Error(`build: dist/secrets.js does not export ${name}()`);
+}
+if (!Array.isArray(secrets.SECRET_PATTERNS) || secrets.SECRET_PATTERNS.length !== 5) {
+  throw new Error('build: dist/secrets.js must export 5 SECRET_PATTERNS');
+}
+
+for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict', 'enumerateWorkspace', 'fingerprintProtectedDirs', 'diffDigest', 'isSensitiveReviewFile', 'scanWriterOutputForSecrets', 'captureRollbackPoint', 'rollbackTask', 'isValidWorkspaceMarker']) {
   if (typeof engine[name] !== 'function') throw new Error(`build: dist/index.js does not export ${name}()`);
 }
-for (const name of ['apply', 'normalizePluginConfig', 'extractTextBlocks', 'buildActivationSpec']) {
+for (const name of ['apply', 'normalizePluginConfig', 'extractTextBlocks', 'buildActivationSpec', 'restrictChildTools', 'runSubagentChat']) {
   if (typeof plugin[name] !== 'function') throw new Error(`build: dist/plugin.js does not export ${name}()`);
 }
 if (!Array.isArray(plugin.inject) || !plugin.inject.includes('tools')) throw new Error('build: dist/plugin.js must export inject = [\'tools\']');

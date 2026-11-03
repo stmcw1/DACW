@@ -11,8 +11,11 @@
  *      （delivery: 'caller'，不向父会话注入完成通知），返回子代理最终文本。
  *
  * 不变量（与 SAFETY.md 对应）：
- *   - 工具隔离必须真实生效（见上）；preset 不可用或隔离失败时默认 fail-closed 拒绝运行
- *     （allowInheritedPresets 是显式逃生门，打开即接受子代理继承父会话全部工具的风险）；
+ *   - 工具隔离必须真实生效（见上）；preset 不可用或隔离失败时默认 fail-closed 拒绝运行。
+ *     「无法确认隔离」同样是失败：provider 未返回有效 childId（无法确认隔离生效）、或子代理
+ *     上下文缺少 tools.schemas（缺少验证能力）——一律先回收子代理再抛错，绝不记为成功；
+ *     enforceChildToolIsolation=false 是唯一逃生门（用户显式接受风险），allowInheritedPresets
+ *     仅用于允许继承父会话 preset，不改变隔离要求；
  *   - 工作区必须是空目录或带【本插件写入的合法】.dacw-workspace 标记目录，否则拒绝运行，
  *     防止误删用户文件；
  *   - 所有失败都抛错，不静默成功。
@@ -20,15 +23,16 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { apply as createEngine } from './index';
+import { apply as createEngine, isValidWorkspaceMarker, resolveEngineOptions, rollbackTask } from './index';
+import type { RollbackExecutionInfo } from './index';
+import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
+import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
-const PLUGIN_VERSION = '1.0.2';
+const PLUGIN_VERSION = '1.1.0';
 const WRITER_PRESET_ID = 'dacw-writer';
 const REVIEWER_PRESET_ID = 'dacw-reviewer';
 const WORKSPACE_MARKER = '.dacw-workspace';
 const WORKSPACE_MARKER_MANAGED_BY = '@stmcw1/dacw';
-/** 0.1 时代的包名：保留对旧标记的兼容，避免升级后既有工作区无法继续使用。 */
-const LEGACY_WORKSPACE_MARKER_MANAGED_BY = '@local/dacw';
 const WORKSPACE_MARKER_CONTENT =
     `{"managedBy":"${WORKSPACE_MARKER_MANAGED_BY}","version":"${PLUGIN_VERSION}",` +
     `"note":"DACW resets non-foundation files in this directory every round. Remove this marker to revoke that."}\n`;
@@ -81,6 +85,12 @@ export interface PluginConfig {
     manifestMaxEntries: number;
     allowInheritedPresets: boolean;
     enforceChildToolIsolation: boolean;
+    /** 测试执行策略：默认 host（宿主直执，无隔离）；容器模式为可选配置（sandbox 分支）。 */
+    sandbox: SandboxConfig;
+    /** G3 逃生门（默认 false）：允许截断/仅摘要的审查放行 success:true（降低安全保证）。 */
+    allowTruncatedReview: boolean;
+    /** 写手输出秘密扫描（默认 true）；false 显式关闭（降低安全保证）。 */
+    secretScanEnabled: boolean;
 }
 
 export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
@@ -100,6 +110,9 @@ export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
     manifestMaxEntries: 400,
     allowInheritedPresets: false,
     enforceChildToolIsolation: true,
+    sandbox: DEFAULT_SANDBOX_CONFIG,
+    allowTruncatedReview: false,
+    secretScanEnabled: true,
 };
 
 function positiveIntOr(value: unknown, fallback: number, warnings: string[], field: string): number {
@@ -150,9 +163,13 @@ function normalizeModelConfig(value: unknown, warnings: string[], field: string)
  * 合并并校验插件配置；非法字段回退默认值并记录警告（不抛错，避免一个错字导致插件无法激活）。
  * 纯函数，供回归自测。
  */
-export function normalizePluginConfig(raw: unknown): { config: PluginConfig; warnings: string[] } {
+export function normalizePluginConfig(raw: unknown): { config: PluginConfig; warnings: string[]; sandboxExplicit: boolean } {
     const warnings: string[] = [];
     const input = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+    // 只有用户显式写了 sandbox.mode === 'host' 才算"显式选择宿主执行"；默认值（auto，沙盒开启）不告警。
+    const rawSandbox = input.sandbox;
+    const sandboxExplicit = !!rawSandbox && typeof rawSandbox === 'object' && !Array.isArray(rawSandbox)
+        && (rawSandbox as Record<string, unknown>).mode === 'host';
     let toolName = nonEmptyStringOr(input.toolName, DEFAULT_PLUGIN_CONFIG.toolName, warnings, 'toolName');
     if (!/^[a-z][a-z0-9_]*$/.test(toolName)) {
         warnings.push(`config.toolName 非法（需匹配 /^[a-z][a-z0-9_]*$/），已回退默认值 ${DEFAULT_PLUGIN_CONFIG.toolName}`);
@@ -178,6 +195,9 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
         manifestMaxEntries: positiveIntOr(input.manifestMaxEntries, DEFAULT_PLUGIN_CONFIG.manifestMaxEntries, warnings, 'manifestMaxEntries'),
         allowInheritedPresets: input.allowInheritedPresets === true,
         enforceChildToolIsolation: input.enforceChildToolIsolation !== false,
+        sandbox: normalizeSandboxConfig(input.sandbox, warnings, 'config.sandbox'),
+        allowTruncatedReview: input.allowTruncatedReview === true,
+        secretScanEnabled: input.secretScanEnabled !== false,
     };
     if (config.chatTimeoutMaxMs < config.chatTimeoutBaseMs) {
         warnings.push('config.chatTimeoutMaxMs 小于 chatTimeoutBaseMs，已把 chatTimeoutMaxMs 提升到 base');
@@ -189,7 +209,18 @@ export function normalizePluginConfig(raw: unknown): { config: PluginConfig; war
     if (!config.enforceChildToolIsolation) {
         warnings.push('config.enforceChildToolIsolation=false：不再强制剥离子代理的宿主全局工具');
     }
-    return { config, warnings };
+    if (sandboxExplicit) {
+        warnings.push('config.sandbox.mode="host"：测试将以宿主用户全权限直接执行写手产出的代码（无任何隔离）。'
+            + '仅在你显式信任写手输出与工作区内容时使用。');
+    }
+    if (config.allowTruncatedReview) {
+        warnings.push('config.allowTruncatedReview=true：审查输入被截断或锁文件仅送摘要时仍会返回 success:true，'
+            + '安全保证降低（默认 fail-closed 拒绝）。');
+    }
+    if (!config.secretScanEnabled) {
+        warnings.push('config.secretScanEnabled=false：写手输出不再做凭据模式扫描，密钥可能进入代码/审查上下文（安全保证降低）。');
+    }
+    return { config, warnings, sandboxExplicit };
 }
 
 /** 从子代理 `SubagentResult.output`（ContentBlock[]）提取最终文本；非 text block 忽略。 */
@@ -539,30 +570,41 @@ interface IsolationState {
 /**
  * 把宿主全局工具从 DACW 子代理作用域中全部剥除，并在隔离后校验子代理作用域确实看不到工具。
  * 失败时【抛错】：agent/created 是 serial 监听器，抛错会让本次子代理创建失败（不发布），
- * 避免"已发布但还带着继承工具"的时间窗。返回 void（成功）或 throw。
+ * 避免"已发布但还带着继承工具"的时间窗。
+ *
+ * fail-closed（E 组）：只有「restrict 成功应用」+「tools.schemas(agent) 返回空数组」两个条件
+ * 同时满足才记为成功；验证能力缺失（缺 tools.schemas / 返回非数组 / 调用抛错）一律 fail，
+ * 绝不"无法验证但记成功"。enforceChildToolIsolation=false 是唯一逃生门（见 apply()）。
  */
-function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, logger: ReturnType<typeof makeLogger>): void {
+export function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, logger: ReturnType<typeof makeLogger>): void {
     const fail = (reason: string): never => {
         isolation.failures += 1;
         isolation.lastError = reason;
         logger.error(`DACW: 子代理工具隔离失败：${reason}`);
         throw new Error(`[DACW] 子代理工具隔离失败：${reason}`);
     };
+    /** 隔离机制已应用、但验证能力缺失：先打诚实的"无法验证"日志，再 fail（不得记为成功）。 */
+    const failUnverified = (reason: string): never => {
+        logger.error(`DACW: 子代理 ${String(agent && agent.id)} 隔离已应用但无法验证（${reason}）`);
+        return fail(reason);
+    };
     if (!agent || !agent.ctx || !agent.ctx.tools || typeof agent.ctx.tools.restrict !== 'function') {
         fail('子代理上下文缺少 tools.restrict');
     }
     const childId = String(agent.id);
     let dispose: unknown = null;
+    let restrictApplied = false;
     let strategy = '';
     try {
         // 首选 allow: []：完全遮蔽全部工具（含之后才注册的全局工具）。
         dispose = agent.ctx.tools.restrict({ allow: [] });
+        restrictApplied = true;
         strategy = 'allow:[]';
     } catch {
-        // 宿主不接受空 allow 时回退为 deny 快照；拿不到快照就 fail-closed。
+        // 只有 allow:[] 失败时才走 deny 快照回退；回退必须能枚举全局工具，否则无法安全回退。
+        if (typeof ctx.tools.schemas !== 'function') fail('无法枚举宿主全局工具（ctx.tools.schemas 缺失），无法安全回退');
         let names: string[] = [];
         try {
-            if (typeof ctx.tools.schemas !== 'function') fail('无法枚举宿主全局工具（ctx.tools.schemas 缺失），无法安全回退');
             names = ctx.tools.schemas()
                 .map((schema: any) => schema && schema.name)
                 .filter((name: unknown) => typeof name === 'string' && name);
@@ -570,30 +612,34 @@ function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, log
             fail(`读取宿主全局工具列表失败：${errorMessage(error)}`);
         }
         if (names.length === 0) {
-            // 没有可 deny 的全局工具：空 deny 会被拒绝，只能依赖下面的"可见工具为空"校验。
-            dispose = null;
-            strategy = 'no-global-tools';
-        } else {
-            try {
-                dispose = agent.ctx.tools.restrict({ deny: names });
-                strategy = `deny:${names.join(',')}`;
-            } catch (error) {
-                fail(`ctx.tools.restrict 执行失败：${errorMessage(error)}`);
-            }
+            // 空 deny 会被宿主拒绝：没有可应用的隔离机制 => 不可记为成功（fail-closed）。
+            fail('宿主全局工具列表为空且 allow:[] 不可用，无法应用工具隔离');
+        }
+        try {
+            dispose = agent.ctx.tools.restrict({ deny: names });
+            restrictApplied = true;
+            strategy = `deny:${names.join(',')}`;
+        } catch (error) {
+            fail(`ctx.tools.restrict 执行失败：${errorMessage(error)}`);
         }
     }
-    // 生效校验：隔离后子代理作用域可见的工具必须为空。
+    // 生效校验：必须同时满足「restrict 成功应用」+「schemas(agent) 返回空数组」才记为成功。
+    if (!restrictApplied) failUnverified('restrict 未成功应用');
+    if (typeof agent.ctx.tools.schemas !== 'function') {
+        failUnverified('子代理上下文缺少 tools.schemas，无法验证隔离生效');
+    }
+    let visible: unknown;
     try {
-        if (typeof agent.ctx.tools.schemas === 'function') {
-            const visible = agent.ctx.tools.schemas(agent);
-            if (Array.isArray(visible) && visible.length > 0) {
-                const names = visible.map((schema: any) => schema && schema.name).filter(Boolean).join(', ');
-                fail(`隔离后子代理仍可见 ${visible.length} 个工具（${names}）`);
-            }
-        }
+        visible = agent.ctx.tools.schemas(agent);
     } catch (error) {
-        if (error instanceof Error && error.message.startsWith('[DACW]')) throw error;
-        fail(`隔离生效校验失败：${errorMessage(error)}`);
+        failUnverified(`调用 tools.schemas(agent) 失败：${errorMessage(error)}`);
+    }
+    if (!Array.isArray(visible)) {
+        failUnverified('tools.schemas(agent) 未返回工具数组，无法验证隔离生效');
+    }
+    if (visible.length > 0) {
+        const names = visible.map((schema: any) => schema && schema.name).filter(Boolean).join(', ');
+        fail(`隔离后子代理仍可见 ${visible.length} 个工具（${names}）`);
     }
     if (typeof dispose === 'function') isolation.disposers.set(childId, dispose as () => void);
     isolation.restricted.add(childId);
@@ -602,10 +648,10 @@ function restrictChildTools(ctx: any, agent: any, isolation: IsolationState, log
 }
 
 /** 子代理最终文本 → 协调器需要的字符串；失败时抛出结构化错误（协调器会打回/终止）。 */
-async function runSubagentChat(options: {
+export async function runSubagentChat(options: {
     subagents: any;
     config: PluginConfig;
-    presets: { ready: boolean };
+    presets: { ready: boolean; reason?: string };
     isolation: IsolationState;
     agent: unknown;
     workspaceDir: string;
@@ -632,13 +678,35 @@ async function runSubagentChat(options: {
         throw new Error(`[DACW] ${role} 子代理启动失败：${errorMessage(error)}`);
     }
     const childId = activation && activation.childId ? String(activation.childId) : '';
+    const disposeActivation = async () => {
+        try { if (activation && typeof activation.dispose === 'function') await activation.dispose(); } catch { /* 尽力清理 */ }
+    };
 
     // fail-closed：要求隔离生效的子代理，在启动后必须确认工具已被剥离。
-    if (config.enforceChildToolIsolation && presets.ready && childId && !isolation.restricted.has(childId)) {
-        try { if (activation && typeof activation.dispose === 'function') await activation.dispose(); } catch { /* 尽力清理 */ }
-        throw new Error(
-            `[DACW] 子代理 ${childId} 的工具隔离未生效（${isolation.lastError || '未知原因'}）：` +
-            `拒绝在写手/审查者可能继承宿主工具的情况下运行。可修复宿主环境，或在明确接受风险后设置 config.allowInheritedPresets / enforceChildToolIsolation=false。`);
+    // E 组验收：enforce=true 时任何「无法确认隔离」的路径都必须终止——
+    //   preset 不可用（无法确认运行在零工具 preset 上）、provider 未返回 childId、隔离未生效。
+    // 唯一逃生门是显式 enforceChildToolIsolation=false（allowInheritedPresets 不再单独构成旁路）。
+    if (config.enforceChildToolIsolation) {
+        if (!presets.ready) {
+            await disposeActivation();
+            throw new Error(
+                `[DACW] enforceChildToolIsolation=true 但写手/审查者专用 preset 不可用（${presets.reason || '未知原因'}），`
+                + '无法确认子代理运行在零工具 preset 上：拒绝运行。'
+                + '请修复 preset 注册，或在明确接受风险后设置 config.enforceChildToolIsolation=false。');
+        }
+        if (!childId) {
+            await disposeActivation();
+            throw new Error(
+                '[DACW] provider 未返回有效 childId，无法确认隔离生效：'
+                + '拒绝在写手/审查者可能继承宿主工具的情况下运行。'
+                + '可修复宿主环境，或在明确接受风险后设置 config.enforceChildToolIsolation=false。');
+        }
+        if (!isolation.restricted.has(childId)) {
+            await disposeActivation();
+            throw new Error(
+                `[DACW] 子代理 ${childId} 的工具隔离未生效（${isolation.lastError || '未知原因'}）：` +
+                `拒绝在写手/审查者可能继承宿主工具的情况下运行。可修复宿主环境，或在明确接受风险后设置 config.enforceChildToolIsolation=false。`);
+        }
     }
     if (childId) dacwChildren.add(childId);
 
@@ -682,22 +750,9 @@ async function runSubagentChat(options: {
 // ================= 工作区准备与安全闸门 =================
 const PROTECTED_WORKSPACE_ENTRIES = new Set([WORKSPACE_MARKER, 'node_modules', '.git']);
 
-/**
- * 校验 `.dacw-workspace` 标记内容：必须是本插件写入的 JSON（managedBy 匹配）。
- * 仅凭文件名接受标记会让任何带同名文件的目录通过安全闸门，因此必须校验内容。
- * 兼容 0.1 时代的旧包名 `@local/dacw`，避免重命名后既有工作区失效。纯函数。
- */
-export function isValidWorkspaceMarker(content: unknown): boolean {
-    if (typeof content !== 'string' || content.trim() === '') return false;
-    try {
-        const parsed = JSON.parse(content);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-        const managedBy = (parsed as Record<string, unknown>).managedBy;
-        return managedBy === WORKSPACE_MARKER_MANAGED_BY || managedBy === LEGACY_WORKSPACE_MARKER_MANAGED_BY;
-    } catch {
-        return false;
-    }
-}
+// 标记校验的唯一事实来源在 index.ts（rollbackTask 也要用，避免 plugin↔index 循环依赖）；
+// 这里 re-export 以保持既有调用方（含回归自测）的导入路径不变。
+export { isValidWorkspaceMarker };
 
 /** child 是否等于 parent 或位于其内部（路径均已解析；Windows 大小写不敏感由 path.relative 处理）。 */
 function isSameOrInside(parent: string, child: string): boolean {
@@ -786,6 +841,9 @@ function renderToolResultText(value: any): string {
     lines.push(`DACW 结果：${value.success ? '机器闸门通过' : '未通过'}`);
     lines.push(`状态：${value.status}${value.status === 'NEED_HUMAN' ? '（需要人工终审，未经确认不要合入）' : ''}`);
     lines.push(`工作区：${value.workspace}`);
+    if (typeof value.task_id === 'string') {
+        lines.push(`回滚：${value.rollback_available === true ? '可用' : '不可用'}（task_id: ${value.task_id}，调用 dacw_rollback 回滚到任务开始前）`);
+    }
     if (value.models && typeof value.models.writer === 'string' && typeof value.models.reviewer === 'string') {
         lines.push(`模型：✍️ 写手 ${value.models.writer} | 🔍 审查者 ${value.models.reviewer}`);
     }
@@ -805,20 +863,170 @@ function renderToolResultText(value: any): string {
     return lines.join('\n');
 }
 
+function renderRollbackResultText(value: any): string {
+    const lines: string[] = [];
+    lines.push(`DACW 回滚：${value.success ? '成功' : '未成功'}`);
+    if (value.mode) {
+        lines.push(`模式：${value.mode === 'git-hint' ? 'git 提示（DACW 未执行 git 命令）' : '工作区备份恢复'}`);
+    }
+    if (typeof value.task_id === 'string') lines.push(`任务：${value.task_id}`);
+    if (typeof value.workspace === 'string') lines.push(`工作区：${value.workspace}`);
+    lines.push('');
+    lines.push(`说明：${String(value.message ?? '')}`);
+    if (value.record && typeof value.record.hint === 'string' && value.record.hint) {
+        lines.push('');
+        lines.push('手动回滚命令（含风险提示，请先阅读）：');
+        lines.push(value.record.hint);
+    }
+    return lines.join('\n');
+}
+
+const ROLLBACK_TOOL_DESCRIPTION =
+    '调用时必须传 confirm: true 表示有意调用。' +
+    '回滚 DACW 任务到任务开始前。git 工作区返回回滚指令（DACW 不执行 git 命令）；' +
+    '非 git 工作区从备份恢复。回滚需人工触发，执行前会通过宿主 userQuestions 请求人类确认；' +
+    '宿主无交互能力且未显式设置 DACW_ROLLBACK_TOKEN 时拒绝执行（fail-closed），回滚后任务终止。' +
+    '必须与执行该任务的同一个 DACW 插件实例/状态配置一起使用'
+    + '（状态文件按 task_id + 工作区路径定位；编程调用方若注入自定义 stateChecksumFn，回滚必须使用同一函数）。';
+
+const ROLLBACK_TOKEN_ENV = 'DACW_ROLLBACK_TOKEN';
+
+const ROLLBACK_CONFIRM_QUESTION_ID = 'dacw-rollback-confirm';
+const ROLLBACK_CONFIRM_ACCEPT_LABEL = '确认回滚';
+const ROLLBACK_CONFIRM_CANCEL_LABEL = '取消';
+
+/**
+ * 回滚交互确认（B2）：向宿主 userQuestions 发起结构化确认，仅当用户明确选择
+ * 「确认回滚」才返回 true；取消 / 无答案 / 结构非法 → false（由调用方 fail-closed）。
+ * 交互异常：abort 类异常按取消处理（abortError），其余包装为明确错误向上抛。
+ */
+async function askRollbackConfirmation(
+    api: { ask: (request: any) => Promise<any> },
+    exec: any,
+    info: RollbackExecutionInfo,
+): Promise<boolean> {
+    const modeText = info.mode === 'git-hint'
+        ? 'git 工作区：仅返回回滚指令，DACW 不执行任何 git 命令'
+        : '非 git 工作区：从任务开始前的备份恢复文件';
+    const question = [
+        `即将回滚任务 ${info.taskId} 的工作区到任务开始前。`,
+        `模式：${modeText}`,
+        `工作区：${info.workspaceDir}`,
+        `回滚点：${info.rollbackPoint.ref}（捕获于 ${info.rollbackPoint.capturedAt}）`,
+        '回滚后任务终止，且工作区内容将与任务开始前一致。确认继续？',
+    ].join('\n');
+    let answer: any;
+    try {
+        answer = await api.ask({
+            questions: [{
+                id: ROLLBACK_CONFIRM_QUESTION_ID,
+                header: '确认回滚',
+                question,
+                options: [
+                    { label: ROLLBACK_CONFIRM_ACCEPT_LABEL, description: '执行回滚（高影响操作，回滚后任务终止）' },
+                    { label: ROLLBACK_CONFIRM_CANCEL_LABEL, description: '取消：不执行任何回滚，工作区保持不变' },
+                ],
+            }],
+            ...(exec && exec.agent ? { agent: exec.agent } : {}),
+            ...(exec && exec.signal ? { signal: exec.signal } : {}),
+        });
+    } catch (error) {
+        if (exec && exec.signal && exec.signal.aborted) throw abortError();
+        if (isAbortLike(error)) throw abortError();
+        throw new Error(`[DACW] 回滚确认交互失败：${errorMessage(error)}`);
+    }
+    const answers = Array.isArray(answer && answer.answers) ? answer.answers : [];
+    const first = answers.find((item: any) => item && item.id === ROLLBACK_CONFIRM_QUESTION_ID);
+    const selected = first && Array.isArray(first.selected) ? first.selected.map((value: any) => String(value)) : [];
+    return selected.includes(ROLLBACK_CONFIRM_ACCEPT_LABEL);
+}
+
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
     '独立审查者子代理审计全量文件并给出 JSON 裁决 → 通过后停在人工闸门（NEED_HUMAN），绝不自动合入。' +
+    '测试在任何审查之前执行；默认 host（执行隔离默认关闭，测试以宿主用户权限运行写手产出的代码）。' +
+    '如需容器隔离可显式配置 sandbox.mode:"auto"：Docker 可用时在一次性容器内跑测试（无网络、只读根文件系统、' +
+    '非 root、资源受限）；Docker 不可用时通过 ctx.userQuestions 交互询问是否降级，拒绝或无法确认即 fail-closed 停止；' +
+    'sandbox.mode:"docker" 强制容器，不可用时拒绝运行。审查者审计是侦探性控制，不是执行前屏障。' +
     '当需要"让模型写代码、让真实测试验证、让独立审查者把关、最后人工确认"时使用本工具。' +
     '注意：DACW 每轮都会把工作区内容重置为产出文件集（仅保留 package.json 等地基文件与 .git/node_modules），' +
     '因此必须指向专用空目录（工具会写入 .dacw-workspace 标记）；不要在存放重要文件的目录上运行。' +
     '模型调用发生在独立子代理会话里，不污染当前会话；子代理在创建时被剥除全部宿主工具。' +
     '写手/审查者可分别配置模型：支持 "provider/model"、纯 "model"（按 DSH 已配置模型目录自动解析 provider）或 inherit；' +
-    '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。';
+    '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。' +
+    '结果含 task_id 与 rollback_available；需要撤销本次任务时用 dacw_rollback（人工触发，回滚后任务终止）。';
+
+// ================= 宿主兼容性探测（apply 开始时 fail-fast）=================
+/**
+ * 探测插件实际依赖的宿主能力：**结构性 API** 缺失 → 抛错拒绝激活（不带病激活到工具调用时才炸）；
+ * **provider 注册** 缺失 → 仅 warn（可能是 bundle 加载顺序问题，真正的缺失会在 dacw_run 调用时再次检查并拒绝）。
+ * 探测路径与实际调用保持一致（见 runSubagentChat 与 agent/created 隔离逻辑）。
+ * 注意：DSH 0.2.1-rc.5 的子代理激活入口是 `ctx.subagents.startActivation(spec)`；
+ * provider（如 spawn）对象只有 name/capabilities/prepareContinuable，**没有** startActivation。
+ */
+function hostIncompatible(capability: string, detail?: string): Error {
+    const reason = detail
+        ? `（${detail}；DSH 版本可能低于 0.2.1-rc.5 或 API 已变更）`
+        : '（DSH 版本可能低于 0.2.1-rc.5 或 API 已变更）';
+    return new Error(`[DACW] 宿主不兼容：缺少 ${capability}${reason}。\n请确认 DSH 版本，或联系插件维护者。`);
+}
+
+function assertHostCompatibility(ctx: any, config: PluginConfig, logger: { warn: (message: string) => void }): void {
+    const tools: any = (() => { try { return ctx && ctx.tools; } catch { return undefined; } })();
+    if (!tools || typeof tools.register !== 'function') {
+        throw hostIncompatible('ctx.tools.register');
+    }
+    // 条件性必需：关闭子代理工具隔离时，restrict 不是插件激活的前提。
+    if (config.enforceChildToolIsolation && typeof tools.restrict !== 'function') {
+        throw hostIncompatible('ctx.tools.restrict', 'config.enforceChildToolIsolation=true 时必需');
+    }
+    const getService = (name: string): any => {
+        try { return ctx && typeof ctx.get === 'function' ? ctx.get(name) : undefined; } catch { return undefined; }
+    };
+    const agentPresets = getService('agentPresets');
+    if (!agentPresets || typeof agentPresets.register !== 'function') {
+        throw hostIncompatible("ctx.get('agentPresets').register");
+    }
+    const subagents = getService('subagents');
+    if (!subagents || typeof subagents.getProvider !== 'function') {
+        throw hostIncompatible("ctx.get('subagents').getProvider");
+    }
+    if (typeof subagents.startActivation !== 'function') {
+        throw hostIncompatible("ctx.get('subagents').startActivation");
+    }
+    // provider 注册缺失不拒绝激活（可能是加载顺序问题）：warn 并留待 dacw_run 时再次检查。
+    const providerName = String(config.subagentProvider || 'spawn');
+    let provider: any;
+    try { provider = subagents.getProvider(providerName); } catch { provider = undefined; }
+    if (!provider || typeof provider !== 'object') {
+        logger.warn(`DACW: provider "${providerName}" 在激活时尚未注册（可能是加载顺序问题）；将在 dacw_run 调用时再次检查。`);
+    }
+}
 
 export function apply(ctx: any, rawConfig?: unknown) {
-    const { config, warnings } = normalizePluginConfig(rawConfig);
+    const { config, warnings, sandboxExplicit } = normalizePluginConfig(rawConfig);
     const logger = makeLogger(ctx);
+    // apply() 开头、任何 ctx.effect 之前：结构性宿主 API 不兼容直接拒绝激活；provider 缺失仅 warn。
+    assertHostCompatibility(ctx, config, logger);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
+
+    // 引擎配置在插件实例内解析一次：dacw_run（写入状态）与 dacw_rollback（读取状态）必须使用
+    // 同一个 stateChecksumFn，否则回滚验签必然失败。函数类型无法从 YAML 解析，插件路径恒为
+    // null（内置 SHA-256）；编程调用方可直接 apply() 透传自定义函数（要求同一实例内一致）。
+    const resolvedEngineOptions = resolveEngineOptions({
+        maxRounds: config.maxRounds,
+        chatTimeoutBaseMs: config.chatTimeoutBaseMs,
+        chatTimeoutPer10kCharsMs: config.chatTimeoutPer10kCharsMs,
+        chatTimeoutMaxMs: config.chatTimeoutMaxMs,
+        chatMaxAttempts: config.chatMaxAttempts,
+        writerOutputMaxChars: config.writerOutputMaxChars,
+        manifestMaxEntries: config.manifestMaxEntries,
+        stateDir: config.stateDir || null,
+        sandbox: config.sandbox,
+        sandboxExplicit,
+        allowTruncatedReview: config.allowTruncatedReview,
+        secretScanEnabled: config.secretScanEnabled,
+    });
 
     // ---- 子代理 preset 注册（persona-only；工具隔离由 agent/created 监听器完成）----
     const presets: { ready: boolean; reason: string; disposers: Array<() => Promise<void> | void> } = {
@@ -964,8 +1172,10 @@ export function apply(ctx: any, rawConfig?: unknown) {
                     files: { type: 'array', items: { type: 'string' } },
                     logs: { type: 'array', items: { type: 'string' } },
                     elapsed_ms: { type: 'integer' },
+                    task_id: { type: 'string' },
+                    rollback_available: { type: 'boolean' },
                 },
-                required: ['success', 'status', 'message', 'workspace', 'models', 'round', 'files', 'logs', 'elapsed_ms'],
+                required: ['success', 'status', 'message', 'workspace', 'models', 'round', 'files', 'logs', 'elapsed_ms', 'task_id', 'rollback_available'],
                 additionalProperties: false,
             },
             render: (_args: unknown, value: any) => [{ type: 'text', text: renderToolResultText(value) }],
@@ -992,7 +1202,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 throw new Error(
                     `[DACW] 子代理 provider "${providerName}" 不支持 agentPreset（独立 preset 子代理），` +
                     `无法保证写手/审查者运行在专用零工具 preset 上；请改用 spawn（@deepseek-ai/dsh-subagent-spawn-in-process），` +
-                    `或在明确接受风险后设置 config.allowInheritedPresets: true。`);
+                    `或在明确接受风险后同时设置 config.allowInheritedPresets: true 与 config.enforceChildToolIsolation: false。`);
             }
             const agent = exec && exec.agent ? exec.agent : null;
             if (!agent) throw new Error('[DACW] 只能由 Agent 调用：执行上下文缺少调用方 Agent');
@@ -1001,7 +1211,7 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 throw new Error(
                     `[DACW] 写手/审查者专用 preset 不可用（${presets.reason}），拒绝让子代理继承父会话工具运行。` +
                     `请修复 preset 注册（需要 @deepseek-ai/dsh-persona 与 agentPresets 服务），` +
-                    `或在明确接受风险后设置 config.allowInheritedPresets: true。`);
+                    `或在明确接受风险后设置 config.allowInheritedPresets: true 与 config.enforceChildToolIsolation: false。`);
             }
 
             // 解析写手/审查者实际模型：读取 DSH 已配置模型目录 / 默认模型；配置错误在启动工作流前 fail-closed。
@@ -1031,17 +1241,37 @@ export function apply(ctx: any, rawConfig?: unknown) {
                         roleModel: role === 'writer' ? roleModels.writer : roleModels.reviewer,
                     });
                 },
+                /**
+                 * 沙盒不可用来询问人类：「是否关闭沙盒」。
+                 * 通过 DSH 的 ctx.userQuestions seam 弹出确认；服务缺失时返回 unavailable，
+                 * 由引擎 fail-closed 停止（不崩溃、不静默降级）。
+                 */
+                async askUserQuestion(request: SandboxConsentRequest): Promise<SandboxConsentResult> {
+                    const userQuestions: any = (() => { try { return ctx.get('userQuestions'); } catch { return undefined; } })();
+                    if (!userQuestions || typeof userQuestions.ask !== 'function') {
+                        return { decision: 'unavailable', reason: '宿主未提供 ctx.userQuestions 交互服务（无法弹出沙盒确认）' };
+                    }
+                    try {
+                        const answer = await userQuestions.ask({
+                            questions: [{
+                                id: 'dacw-sandbox-consent',
+                                question: request.message,
+                                header: request.title,
+                                options: request.options.map((option) => ({ label: option.label, description: option.description })),
+                            }],
+                            ...(agent ? { agent } : {}),
+                            ...(signal ? { signal } : {}),
+                        });
+                        return parseSandboxConsentAnswer(answer, request);
+                    } catch (error) {
+                        if ((signal && signal.aborted) || isAbortLike(error)) throw abortError();
+                        return { decision: 'unavailable', reason: `沙盒确认交互失败：${errorMessage(error)}` };
+                    }
+                },
                 log,
             };
             const executeTask = createEngine(engineContext, {
-                maxRounds: config.maxRounds,
-                chatTimeoutBaseMs: config.chatTimeoutBaseMs,
-                chatTimeoutPer10kCharsMs: config.chatTimeoutPer10kCharsMs,
-                chatTimeoutMaxMs: config.chatTimeoutMaxMs,
-                chatMaxAttempts: config.chatMaxAttempts,
-                writerOutputMaxChars: config.writerOutputMaxChars,
-                manifestMaxEntries: config.manifestMaxEntries,
-                stateDir: config.stateDir || null,
+                ...resolvedEngineOptions,
                 roleModels: roleModelLabels,
             });
             const rawTaskId = taskIdArg || `dacw-${Date.now().toString(36)}`;
@@ -1053,10 +1283,12 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 workspace: workspaceDir,
                 models: roleModelLabels,
                 round: typeof result.round === 'number' ? result.round : 0,
-                files: Array.isArray(result.files) ? result.files.map(String) : [],
-                logs: tailLogs(logs, 60, 8000),
-                elapsed_ms: Date.now() - startedAt,
-            };
+                    files: Array.isArray(result.files) ? result.files.map(String) : [],
+                    logs: tailLogs(logs, 60, 8000),
+                    elapsed_ms: Date.now() - startedAt,
+                    task_id: rawTaskId,
+                    rollback_available: result.rollbackPointCaptured === true,
+                };
             if (!value.success) {
                 const failure = new Error(
                     `[DACW] 工作流未通过（status=${value.status}，round=${value.round}）：${value.message}\n` +
@@ -1068,8 +1300,128 @@ export function apply(ctx: any, rawConfig?: unknown) {
         },
     };
 
+    // ---- 回滚工具（人工触发；git 模式只给提示，非 git 模式从备份恢复）----
+    const rollbackToolDefinition = {
+        name: 'dacw_rollback',
+        description: ROLLBACK_TOOL_DESCRIPTION,
+        parameters: {
+            type: 'object',
+            properties: {
+                task_id: { type: 'string', description: '要回滚的任务 ID（dacw_run 返回的 task_id）。' },
+                workspace: { type: 'string', description: '可选，dacw_run 时使用的工作区；省略则用配置的 workspace，再退回当前会话工作目录。' },
+                reason: { type: 'string', description: '可选，回滚原因，记录到审计，限 500 字符。' },
+                confirm: {
+                    type: 'boolean',
+                    description: '必填。传 true 表示有意调用回滚（高影响操作，必须显式确认）。',
+                },
+            },
+            required: ['task_id', 'confirm'],
+            additionalProperties: false,
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    success: { type: 'boolean' },
+                    mode: { type: ['string', 'null'] },
+                    message: { type: 'string' },
+                    task_id: { type: 'string' },
+                    workspace: { type: 'string' },
+                    record: { type: ['object', 'null'] },
+                },
+                required: ['success', 'mode', 'message', 'task_id', 'workspace', 'record'],
+                additionalProperties: false,
+            },
+            render: (_args: unknown, value: any) => [{ type: 'text', text: renderRollbackResultText(value) }],
+        },
+        async execute(rawArgs: unknown, exec: any) {
+            const args = rawArgs && typeof rawArgs === 'object' ? rawArgs as Record<string, unknown> : {};
+            const taskId = typeof args.task_id === 'string' ? args.task_id.trim() : '';
+            if (!taskId) throw new Error('[DACW] 参数 task_id 必须是非空字符串');
+            if (taskId.length > MAX_TASK_ID_CHARS) throw new Error(`[DACW] task_id 过长（${taskId.length} > ${MAX_TASK_ID_CHARS}）`);
+
+            // C3：高影响操作必须显式传 confirm: true；校验在 prepareWorkspace 之前（不触碰文件系统）。
+            if (args.confirm !== true) {
+                throw new Error(
+                    '[DACW] 回滚是高影响操作。请传 confirm: true 表示有意调用。\n'
+                    + 'git 工作区：返回回滚指令，不修改文件。\n'
+                    + '非 git 工作区：执行前会请求人工交互确认；宿主无交互能力时需设置 DACW_ROLLBACK_TOKEN。',
+                );
+            }
+
+            const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+            if (reason.length > 500) throw new Error(`[DACW] reason 过长（${reason.length} > 500）`);
+
+            const workspaceArg = typeof args.workspace === 'string' ? args.workspace.trim() : '';
+            if (workspaceArg.length > MAX_WORKSPACE_ARG_CHARS) throw new Error(`[DACW] workspace 过长（${workspaceArg.length} > ${MAX_WORKSPACE_ARG_CHARS}）`);
+
+            const agent = exec && exec.agent ? exec.agent : null;
+            if (!agent) throw new Error('[DACW] 只能由 Agent 调用：执行上下文缺少调用方 Agent');
+            if (isDacwChild(agent)) throw new Error('[DACW] 禁止在 DACW 子代理内调用 dacw_rollback');
+
+            const signal: AbortSignal | undefined = exec && exec.signal ? exec.signal : undefined;
+            // 每次调用时探测（与 dacw_run 的 askUserQuestion 一致）：避免 apply() 时服务
+            // 加载顺序晚于 DACW 导致永久降级到 token 路径。
+            const userQuestionsApi: { ask: (request: any) => Promise<any> } | null = (() => {
+                try {
+                    const svc = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined;
+                    return svc && typeof svc.ask === 'function' ? svc : null;
+                } catch { return null; }
+            })();
+            // 必须与 dacw_run 使用同一个 callerWorkingDirectory / prepareWorkspace / config.workspace 解析：
+            // StateManager 构造时 rawTaskId + workspaceDir 参与哈希，路径不一致就找不到状态文件。
+            const baseDir = await callerWorkingDirectory(agent, signal);
+            const requested = workspaceArg || config.workspace;
+            const workspaceDir = await prepareWorkspace(baseDir, requested, config.workspacePolicy);
+
+            // 高影响操作授权：真正执行回滚前，必须获得人类明确确认。
+            //  - 有 userQuestions：交互确认（仅「确认回滚」放行；取消/结构缺失 → fail-closed）；
+            //  - 无 userQuestions（headless 宿主）：要求显式设置 DACW_ROLLBACK_TOKEN（非空）才放行，
+            //    否则拒绝执行（fail-closed）。两种路径都不会在未授权时改动工作区或写回滚审计。
+            const onBeforeExecute = async (info: RollbackExecutionInfo): Promise<void> => {
+                if (userQuestionsApi) {
+                    const confirmed = await askRollbackConfirmation(userQuestionsApi, exec, info);
+                    if (!confirmed) throw new Error('[DACW] 用户未确认回滚，已取消执行（工作区未改动）');
+                    return;
+                }
+                const token = String(process.env[ROLLBACK_TOKEN_ENV] ?? '').trim();
+                if (!token) {
+                    throw new Error(
+                        `[DACW] 宿主未提供 userQuestions 交互能力，且未设置 ${ROLLBACK_TOKEN_ENV}：拒绝执行回滚（fail-closed）`,
+                    );
+                }
+                logger.info(`DACW: 宿主无交互能力，使用 ${ROLLBACK_TOKEN_ENV} 显式授权执行回滚（task_id=${taskId}）`);
+            };
+
+            const stateDir = config.stateDir || path.join(os.tmpdir(), 'dacw-state');
+            const result = await rollbackTask(
+                stateDir, taskId, workspaceDir,
+                reason || undefined,
+                resolvedEngineOptions.stateChecksumFn ?? undefined,
+                onBeforeExecute,
+            );
+            const value = {
+                success: result.success,
+                mode: result.mode,
+                message: result.message,
+                task_id: taskId,
+                workspace: workspaceDir,
+                record: result.record ?? null,
+            };
+            if (!result.success) {
+                const failure = new Error(`[DACW] 回滚未成功：${result.message}`);
+                (failure as any).dacwRollback = value;
+                throw failure;
+            }
+            logger.info(`DACW: 回滚完成（task_id=${taskId}, mode=${value.mode}, workspace=${workspaceDir}）`);
+            return value;
+        },
+    };
+
     ctx.effect(() => ctx.tools.register(toolDefinition));
+    ctx.effect(() => ctx.tools.register(rollbackToolDefinition));
     logger.info(
-        `DACW: 工具 ${config.toolName} 已注册（workspacePolicy=${config.workspacePolicy}, provider=${config.subagentProvider}, ` +
-        `enforceChildToolIsolation=${config.enforceChildToolIsolation}）`);
+        `DACW: 工具 ${config.toolName} 已注册（workspacePolicy=${config.workspacePolicy}, sandbox=${config.sandbox.mode}, ` +
+        `provider=${config.subagentProvider}, enforceChildToolIsolation=${config.enforceChildToolIsolation}）`);
+    logger.info('DACW: 工具 dacw_rollback 已注册（回滚到任务开始前；git 工作区仅返回命令提示）');
 }

@@ -2,12 +2,56 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
 
-// 单实例假设：writeChain 仅提供进程内互斥。多进程/多会话对同一 taskId 并发
-// 写入时为 last-writer-wins，checksum/HMAC 无法检测丢失更新。
-// 当前部署形态（DSH 插件内单协调器 + workspaceLocks 串行化）满足该假设；
-// 若未来多进程并发，需引入文件锁（O_EXCL 锁文件或等价物），属架构层变更。
+/**
+ * 状态校验：默认确定性 SHA-256——防意外损坏、防手滑改写，不防同账号本地用户
+ * 重算（状态文件与进程同账号可读，重算 checksum 无门槛）。
+ *
+ * 需要更强防篡改能力的调用方可通过 checksumFn 注入自定义校验函数（如基于外部
+ * 密钥源的 HMAC）：DACW 核心不 import 任何第三方签名库，注入函数的正确性与
+ * 密钥管理由调用方负责，DACW 不验证、不感知其实现。
+ *
+ * 单实例假设：writeChain 仅提供进程内互斥。多进程/多会话对同一 taskId 并发
+ * 写入时为 last-writer-wins，checksum 无法检测丢失更新。
+ * 当前部署形态（DSH 插件内单协调器 + workspaceLocks 串行化）满足该假设；
+ * 若未来多进程并发，需引入文件锁（O_EXCL 锁文件或等价物），属架构层变更。
+ */
+
+/** 状态校验函数：输入校验串 body，输出 checksum。默认内置 SHA-256。 */
+export type StateChecksumFn = (body: string) => string;
 
 export type WorkflowStatus = 'IDLE' | 'RUNNING' | 'NEED_HUMAN' | 'DONE';
+
+/** 回滚点类型：git＝任务开始前的 HEAD commit；workspace＝备份目录名。 */
+export type RollbackPointMode = 'git' | 'workspace';
+
+/** 任务开始前捕获的回滚点（用于人工触发回滚）。 */
+export interface RollbackPoint {
+    /** git：任务开始前的 HEAD commit；workspace：备份目录名。 */
+    mode: RollbackPointMode;
+    /** git 为 commit hash；workspace 为 stateDir/backup/<taskId> 下的备份目录名。 */
+    ref: string;
+    /** 捕获时间（ISO 8601）。 */
+    capturedAt: string;
+}
+
+/** 回滚执行方式：git-hint＝只给命令提示不执行 git；workspace-restore＝DACW 从备份恢复。 */
+export type RollbackMode = 'git-hint' | 'workspace-restore';
+
+/** 回滚审计记录（写入 WorkflowState.rollback）。 */
+export interface RollbackRecord {
+    at: string;
+    reason: string;
+    mode: RollbackMode;
+    /** git：commit hash；workspace：备份目录名。 */
+    rollbackPoint: string;
+    beforeFiles: string[];
+    /** git-hint 模式下与 beforeFiles 相同（DACW 未动工作区）。 */
+    afterFiles: string[];
+    /** git-hint: false；workspace-restore: true。 */
+    executed: boolean;
+    /** git-hint 模式给用户的命令提示。 */
+    hint?: string;
+}
 
 
 export interface WorkflowState {
@@ -18,6 +62,14 @@ export interface WorkflowState {
     writtenFiles: string | null;   
     testResult: string | null;     
     reviewResult: string | null;
+    /** 本轮审查阶段因敏感被排除、未送模型审查的文件清单（审计可追溯）；null 表示无排除。 */
+    reviewExcluded: string[] | null;
+    /** 写手输出秘密扫描命中记录（"文件:类别"，不含原文）；null 表示未命中或未启用扫描。 */
+    secretScanHits: string[] | null;
+    /** 任务开始前捕获的回滚点；null 表示未捕获（例如非 git 工作区且备份失败）。 */
+    rollbackPoint: RollbackPoint | null;
+    /** 回滚审计记录（git-hint 或 workspace-restore）；null 表示未回滚。 */
+    rollback: RollbackRecord | null;
     lastError: string | null;      
 }
 
@@ -30,6 +82,10 @@ interface PersistedState {
     writtenFiles: string | null;
     testResult: string | null;
     reviewResult: string | null;
+    reviewExcluded: string[] | null;
+    secretScanHits: string[] | null;
+    rollbackPoint: RollbackPoint | null;
+    rollback: RollbackRecord | null;
     lastError: string | null;
     checksum: string;
 }
@@ -38,48 +94,43 @@ export class StateManager {
     private stateDir: string;
     private stateFilePath: string;
     private taskId: string;
-    private readonly macSecret: string | Buffer | null;
+    private readonly checksumFn: StateChecksumFn;
 
     private writeChain: Promise<unknown> = Promise.resolve();
     private authoritative: WorkflowState | null = null;
     private tmpSeq = 0;
 
     /**
-     * macSecret：提供时使用 HMAC-SHA256 校验。
-     * 运行机里执行的写手代码与协调器同用户同权限，可写 os.tmpdir()；
-     * 无密钥 SHA256 只能防意外损坏，防不了"篡改后重算 checksum"——
-     * 不提供密钥时只能声称防损坏，不得声称防篡改。
-     * 密钥仅存在于协调器内存，且不会经运行机的 env 白名单透传。
-     * 注意：密钥为每次运行随机生成时，跨进程/跨重启的 load() 将无法通过校验；
-     * 当前协调器按单次运行使用状态文件（见协调器 [P2-1] 注释），不受影响。
+     * checksumFn：状态校验函数（省略 → 内置确定性 SHA-256）。
+     * 回滚等跨调用场景必须使用与写入时相同的 checksumFn，否则验签失败。
      *
      * rawTaskId 先消毒、再附加其 SHA256 短哈希作为文件名后缀：
      * "task/1" 与 "task_1" 消毒后同为 "task_1"，哈希后缀消除该碰撞。
      */
-    constructor(stateDir: string, rawTaskId: string, workspaceDir: string, macSecret?: string | Buffer) {
+    constructor(stateDir: string, rawTaskId: string, workspaceDir: string, checksumFn?: StateChecksumFn) {
         const safeTaskId = rawTaskId.replace(/[^a-zA-Z0-9_\-]/g, '_');
         // 哈希输入纳入 workspaceDir：不同工作区的同名任务（"task-1"）不再互相覆盖
-        // 状态文件，"各自 HMAC 均合法的静默交叉覆盖"被根除
+        // 状态文件，"各自合法 checksum 的静默交叉覆盖"被根除
         const idHash = crypto.createHash('sha256')
             .update(String(rawTaskId) + '\n' + String(workspaceDir))
             .digest('hex').slice(0, 8);
         this.taskId = safeTaskId;
-        this.macSecret = macSecret ?? null;
+        this.checksumFn = checksumFn ?? ((body) => crypto.createHash('sha256').update(body).digest('hex'));
         this.stateDir = path.resolve(stateDir);
         this.stateFilePath = path.join(this.stateDir, `state_${safeTaskId}_${idHash}.json`);
     }
 
-    private macOf(body: string): string {
-        if (this.macSecret !== null) {
-            return crypto.createHmac('sha256', this.macSecret).update(body).digest('hex');
-        }
-        return crypto.createHash('sha256').update(body).digest('hex');
-    }
-
     private checksumOf(state: WorkflowState): string {
-        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, lastError } = state;
-        const body = JSON.stringify({ taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, lastError });
-        return this.macOf(body);
+        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, rollbackPoint, rollback, lastError } = state;
+        const body = JSON.stringify({
+            taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
+            reviewExcluded: reviewExcluded ?? null,
+            secretScanHits: secretScanHits ?? null,
+            rollbackPoint: rollbackPoint ?? null,
+            rollback: rollback ?? null,
+            lastError,
+        });
+        return this.checksumFn(body);
     }
 
     private async persist(state: WorkflowState): Promise<void> {
@@ -143,7 +194,8 @@ export class StateManager {
         return this.enqueue(async () => {
             const initial: WorkflowState = {
                 taskId: this.taskId, round: 1, status: 'RUNNING', taskPrompt,
-                writtenFiles: null, testResult: null, reviewResult: null, lastError: null
+                writtenFiles: null, testResult: null, reviewResult: null,
+                reviewExcluded: null, secretScanHits: null, rollbackPoint: null, rollback: null, lastError: null
             };
             await this.persist(initial);
             this.authoritative = initial;
