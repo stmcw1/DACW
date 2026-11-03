@@ -1170,12 +1170,13 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         applyPlugin(ctx, rawConfig);
         return { tools, find: (name) => tools.find((tool) => tool.name === name), disposers, services: mergedServices };
     };
-    await ta('宿主兼容性探测：缺失能力 fail-fast；tools.restrict 按 enforceChildToolIsolation 条件必需', async () => {
-        const makeCtx = (tools, services) => ({
+    await ta('宿主兼容性探测：结构性缺失 fail-fast；provider 未注册仅告警；tools.restrict 条件必需', async () => {
+        const makeCtx = (tools, services, warnLogs = []) => ({
             effect: () => {},
             on: () => () => {},
             get: (name) => services[name],
             tools,
+            logger: { info: () => {}, warn: (message) => warnLogs.push(message), error: () => {} },
         });
         const goodTools = { register: () => () => {}, restrict: () => () => {} };
         const assertMissing = (ctx, rawConfig, pattern) => {
@@ -1207,11 +1208,15 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             agentPresets: makeDefaultHostServices().agentPresets,
             subagents: { getProvider: () => ({ name: 'spawn' }) },
         }), {}, /宿主不兼容：缺少 ctx\.get\('subagents'\)\.startActivation/);
-        // 7) provider 未注册（getProvider 返回 undefined）
-        assertMissing(makeCtx(goodTools, {
+        // 7) provider 未注册（getProvider 返回 undefined）→ 不拒绝激活，仅 warn（留待 dacw_run 再检查）
+        const warnLogs = [];
+        assert.doesNotThrow(() => applyPlugin(makeCtx(goodTools, {
             agentPresets: makeDefaultHostServices().agentPresets,
             subagents: { getProvider: () => undefined, startActivation: async () => ({}) },
-        }), {}, /宿主不兼容：缺少 subagent provider "spawn"/);
+        }, warnLogs), { enforceChildToolIsolation: false, allowInheritedPresets: true }));
+        assert.ok(
+            warnLogs.some((line) => line.includes('provider "spawn"') && line.includes('将在 dacw_run 调用时再次检查')),
+            JSON.stringify(warnLogs));
     });
     await ta('工具层：dacw_run 结果含 task_id/rollback_available；dacw_rollback git 模式端到端', async () => {
         const baseDir = path.join(tmpRoot, 'tool-git-base');

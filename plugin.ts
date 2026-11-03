@@ -902,7 +902,8 @@ const TOOL_DESCRIPTION =
 
 // ================= 宿主兼容性探测（apply 开始时 fail-fast）=================
 /**
- * 探测插件实际依赖的宿主能力；缺失时抛错拒绝激活（不带病激活到工具调用时才炸）。
+ * 探测插件实际依赖的宿主能力：**结构性 API** 缺失 → 抛错拒绝激活（不带病激活到工具调用时才炸）；
+ * **provider 注册** 缺失 → 仅 warn（可能是 bundle 加载顺序问题，真正的缺失会在 dacw_run 调用时再次检查并拒绝）。
  * 探测路径与实际调用保持一致（见 runSubagentChat 与 agent/created 隔离逻辑）。
  * 注意：DSH 0.2.1-rc.5 的子代理激活入口是 `ctx.subagents.startActivation(spec)`；
  * provider（如 spawn）对象只有 name/capabilities/prepareContinuable，**没有** startActivation。
@@ -914,7 +915,7 @@ function hostIncompatible(capability: string, detail?: string): Error {
     return new Error(`[DACW] 宿主不兼容：缺少 ${capability}${reason}。\n请确认 DSH 版本，或联系插件维护者。`);
 }
 
-function assertHostCompatibility(ctx: any, config: PluginConfig): void {
+function assertHostCompatibility(ctx: any, config: PluginConfig, logger: { warn: (message: string) => void }): void {
     const tools: any = (() => { try { return ctx && ctx.tools; } catch { return undefined; } })();
     if (!tools || typeof tools.register !== 'function') {
         throw hostIncompatible('ctx.tools.register');
@@ -937,20 +938,20 @@ function assertHostCompatibility(ctx: any, config: PluginConfig): void {
     if (typeof subagents.startActivation !== 'function') {
         throw hostIncompatible("ctx.get('subagents').startActivation");
     }
-    // provider 必须已注册（默认 spawn，取自 config.subagentProvider）：否则工作流无法启动子代理。
+    // provider 注册缺失不拒绝激活（可能是加载顺序问题）：warn 并留待 dacw_run 时再次检查。
     const providerName = String(config.subagentProvider || 'spawn');
     let provider: any;
     try { provider = subagents.getProvider(providerName); } catch { provider = undefined; }
     if (!provider || typeof provider !== 'object') {
-        throw hostIncompatible(`subagent provider "${providerName}"`, 'getProvider 未返回对象');
+        logger.warn(`DACW: provider "${providerName}" 在激活时尚未注册（可能是加载顺序问题）；将在 dacw_run 调用时再次检查。`);
     }
 }
 
 export function apply(ctx: any, rawConfig?: unknown) {
     const { config, warnings, sandboxExplicit } = normalizePluginConfig(rawConfig);
-    // apply() 开头、任何 ctx.effect 之前：宿主不兼容直接拒绝激活。
-    assertHostCompatibility(ctx, config);
     const logger = makeLogger(ctx);
+    // apply() 开头、任何 ctx.effect 之前：结构性宿主 API 不兼容直接拒绝激活；provider 缺失仅 warn。
+    assertHostCompatibility(ctx, config, logger);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
 
     // 引擎配置在插件实例内解析一次：dacw_run（写入状态）与 dacw_rollback（读取状态）必须使用
