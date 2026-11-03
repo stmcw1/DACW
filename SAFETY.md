@@ -64,6 +64,7 @@ docker 模式的容器约束：`--network none`（无网络）、只读根文件
 - **审计证据的局限：** 本地日志可被本地用户修改，不构成防篡改证据；状态文件（含 `secretScanHits`、`reviewExcluded`、`rollback` 等审计字段）使用确定性 SHA-256 校验，防意外损坏，不防同账号本地用户重算。需要对抗性证据时，应导出并外部存证。
 - **并发限制：** 当前版本不支持多个任务并发操作同一工作区；`dacw_rollback` 应在任务终止后调用。同一工作区的任务在进程内串行执行（`workspaceLocks`），跨进程无文件锁保护。
 - **回滚恢复范围：** 回滚恢复文件内容，不保证文件权限、时间戳、扩展属性（macOS xattr）与回滚点完全一致。需要精确恢复请使用 git（git 工作区 DACW 只提供指令，不执行）。
+- **回滚授权：** git 工作区回滚只生成指令、不修改文件。非 git 工作区回滚有破坏性，执行前需交互确认（DSH `userQuestions`）；宿主无交互能力时需设置 `DACW_ROLLBACK_TOKEN` 环境变量（非空即视为运维显式授权）。该机制防误触发，不构成对具备 shell 能力的主 Agent 的对抗性防线。
 - **进程中断：** 任务执行中被强杀（SIGKILL / 断电）时，状态文件因原子写不会损坏，但可能留下孤儿备份目录；下次同 `task_id` 运行时自动清理。
 - 子代理工具隔离依赖宿主的 `ctx.tools.restrict` 与 `agent/created` 事件；隔离失败或 preset 注册失败时默认拒绝运行。**无法确认隔离同样是失败**：provider 未返回有效 childId、子代理上下文缺少 `tools.schemas` 等验证能力时，调用被终止且不记为成功。唯一逃生门是显式设置 `enforceChildToolIsolation=false`（接受子代理可能继承宿主工具的风险）；`allowInheritedPresets` 仅在关闭隔离要求后才作为配套选项才有意义。
 - 被测试项目的依赖需人工预装，`node_modules` 被视为可信基座；测试进程可以读写它们，host 模式下尤其如此。

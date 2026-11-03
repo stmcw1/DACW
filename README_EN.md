@@ -95,11 +95,14 @@ Example startup log line:
 
 On workflow failure the tool throws (including workspace, status, round and log tail) instead of returning a normal failure result; no path commits or merges anything.
 
-Rollback (`dacw_rollback`, human-triggered; the task terminates afterwards):
+### Rollback (dacw_rollback)
 
-- Call it with the `task_id` returned by `dacw_run`; workspace resolution is identical to `dacw_run` (same baseDir / `config.workspace` / `prepareWorkspace` — a different path cannot find the state file).
-- git workspaces: it only returns the `git reset --hard <ref>` command plus a risk note for `git clean -fd`; **DACW executes no git command**. Non-git workspaces: restored from the backup captured before the task started (the backup is kept for audit/retry).
-- A failed rollback throws (never disguised as success); the state file is verified with the same `stateChecksumFn` used to write it — **rollback must use the same plugin instance** (both default to the built-in SHA-256).
+Rollback is a high-impact operation. The tool requests an interactive human confirmation (DSH `userQuestions`); when the host has no interaction capability, set `DACW_ROLLBACK_TOKEN=<any non-empty string>` in the DSH host environment — otherwise execution is refused.
+
+- **git workspaces**: returns rollback instructions (`git reset --hard <commit>`); executes no git command and modifies no files.
+- **Non-git workspaces**: restores from the backup. Interactive confirmation or token authorization is required before execution.
+
+The task terminates after rollback and the workspace is restored to the rollback point.
 
 ## Sandbox configuration
 

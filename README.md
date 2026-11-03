@@ -95,11 +95,16 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 
 工作流失败时工具抛出错误（附工作区、状态、轮次与日志尾部），不会把失败伪装成普通结果；所有路径都不提交、不合入。
 
-回滚（`dacw_rollback`，人工触发，执行后任务终止）：
+### 回滚（dacw_rollback）
 
-- 用 `dacw_run` 返回的 `task_id` 调用；工作区解析与 `dacw_run` 完全一致（同一套 baseDir / `config.workspace` / `prepareWorkspace`，路径不一致会找不到状态文件）。
-- git 工作区：只返回 `git reset --hard <ref>` 命令与 `git clean -fd` 的风险提示，**DACW 不执行任何 git 命令**；非 git 工作区：从任务开始前的备份恢复（备份保留供审计/重试）。
-- 回滚失败会抛错（不伪装成功）；状态文件校验使用与写入时一致的 `stateChecksumFn`——**必须在同一个插件实例内回滚**（默认均为内置 SHA-256）。
+回滚是高影响操作。调用时工具会请求人类交互确认（DSH `userQuestions`）；
+宿主无交互能力时，需在 DSH 宿主环境设置 `DACW_ROLLBACK_TOKEN=<任意非空字符串>`，
+否则拒绝执行。
+
+- **git 工作区**：返回回滚指令（`git reset --hard <commit>`），不执行任何 git 命令，不修改文件。
+- **非 git 工作区**：从备份恢复。执行前必须通过交互确认或 token 授权。
+
+回滚后任务终止，工作区内容恢复到回滚点。
 
 ## 沙箱配置
 
