@@ -24,6 +24,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { apply as createEngine, isValidWorkspaceMarker, resolveEngineOptions, rollbackTask } from './index';
+import type { RollbackExecutionInfo } from './index';
 import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
 import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
@@ -882,8 +883,61 @@ function renderRollbackResultText(value: any): string {
 
 const ROLLBACK_TOOL_DESCRIPTION =
     '回滚 DACW 任务到任务开始前。git 工作区返回回滚指令（DACW 不执行 git 命令）；' +
-    '非 git 工作区从备份恢复。回滚需人工触发，执行后任务终止。' +
+    '非 git 工作区从备份恢复。回滚需人工触发，执行前会通过宿主 userQuestions 请求人类确认；' +
+    '宿主无交互能力且未显式设置 DACW_ROLLBACK_TOKEN 时拒绝执行（fail-closed），回滚后任务终止。' +
     '必须与执行该任务的同一个 DACW 插件实例/状态配置一起使用（状态文件按 task_id + 工作区路径定位）。';
+
+const ROLLBACK_TOKEN_ENV = 'DACW_ROLLBACK_TOKEN';
+
+const ROLLBACK_CONFIRM_QUESTION_ID = 'dacw-rollback-confirm';
+const ROLLBACK_CONFIRM_ACCEPT_LABEL = '确认回滚';
+const ROLLBACK_CONFIRM_CANCEL_LABEL = '取消';
+
+/**
+ * 回滚交互确认（B2）：向宿主 userQuestions 发起结构化确认，仅当用户明确选择
+ * 「确认回滚」才返回 true；取消 / 无答案 / 结构非法 → false（由调用方 fail-closed）。
+ * 交互异常：abort 类异常按取消处理（abortError），其余包装为明确错误向上抛。
+ */
+async function askRollbackConfirmation(
+    api: { ask: (request: any) => Promise<any> },
+    exec: any,
+    info: RollbackExecutionInfo,
+): Promise<boolean> {
+    const modeText = info.mode === 'git-hint'
+        ? 'git 工作区：仅返回回滚指令，DACW 不执行任何 git 命令'
+        : '非 git 工作区：从任务开始前的备份恢复文件';
+    const question = [
+        `即将回滚任务 ${info.taskId} 的工作区到任务开始前。`,
+        `模式：${modeText}`,
+        `工作区：${info.workspaceDir}`,
+        `回滚点：${info.rollbackPoint.ref}（捕获于 ${info.rollbackPoint.capturedAt}）`,
+        '回滚后任务终止，且工作区内容将与任务开始前一致。确认继续？',
+    ].join('\n');
+    let answer: any;
+    try {
+        answer = await api.ask({
+            questions: [{
+                id: ROLLBACK_CONFIRM_QUESTION_ID,
+                header: '确认回滚',
+                question,
+                options: [
+                    { label: ROLLBACK_CONFIRM_ACCEPT_LABEL, description: '执行回滚（高影响操作，回滚后任务终止）' },
+                    { label: ROLLBACK_CONFIRM_CANCEL_LABEL, description: '取消：不执行任何回滚，工作区保持不变' },
+                ],
+            }],
+            ...(exec && exec.agent ? { agent: exec.agent } : {}),
+            ...(exec && exec.signal ? { signal: exec.signal } : {}),
+        });
+    } catch (error) {
+        if (exec && exec.signal && exec.signal.aborted) throw abortError();
+        if (isAbortLike(error)) throw abortError();
+        throw new Error(`[DACW] 回滚确认交互失败：${errorMessage(error)}`);
+    }
+    const answers = Array.isArray(answer && answer.answers) ? answer.answers : [];
+    const first = answers.find((item: any) => item && item.id === ROLLBACK_CONFIRM_QUESTION_ID);
+    const selected = first && Array.isArray(first.selected) ? first.selected.map((value: any) => String(value)) : [];
+    return selected.includes(ROLLBACK_CONFIRM_ACCEPT_LABEL);
+}
 
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
@@ -953,6 +1007,15 @@ export function apply(ctx: any, rawConfig?: unknown) {
     // apply() 开头、任何 ctx.effect 之前：结构性宿主 API 不兼容直接拒绝激活；provider 缺失仅 warn。
     assertHostCompatibility(ctx, config, logger);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
+
+    // B1：探测宿主用户交互能力（回滚执行前需要人类明确确认，属高影响操作）。
+    // 只读探测：服务缺失 → null；dacw_rollback 届时 fail-closed 拒绝执行（绝不静默回滚）。
+    const userQuestionsApi: { ask: (request: any) => Promise<any> } | null = (() => {
+        try {
+            const svc = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined;
+            return svc && typeof svc.ask === 'function' ? svc : null;
+        } catch { return null; }
+    })();
 
     // 引擎配置在插件实例内解析一次：dacw_run（写入状态）与 dacw_rollback（读取状态）必须使用
     // 同一个 stateChecksumFn，否则回滚验签必然失败。函数类型无法从 YAML 解析，插件路径恒为
@@ -1297,19 +1360,31 @@ export function apply(ctx: any, rawConfig?: unknown) {
             const requested = workspaceArg || config.workspace;
             const workspaceDir = await prepareWorkspace(baseDir, requested, config.workspacePolicy);
 
-            const confirm = typeof args.confirm === 'string' ? args.confirm.trim() : '';
-            const expectedConfirm = `ROLLBACK ${taskId} ${workspaceDir}`;
-            if (confirm !== expectedConfirm) {
-                throw new Error(
-                    `[DACW] 回滚是高影响操作。请提供精确确认参数 confirm，值必须为：${expectedConfirm}`,
-                );
-            }
+            // 高影响操作授权：真正执行回滚前，必须获得人类明确确认。
+            //  - 有 userQuestions：交互确认（仅「确认回滚」放行；取消/结构缺失 → fail-closed）；
+            //  - 无 userQuestions（headless 宿主）：要求显式设置 DACW_ROLLBACK_TOKEN（非空）才放行，
+            //    否则拒绝执行（fail-closed）。两种路径都不会在未授权时改动工作区或写回滚审计。
+            const onBeforeExecute = async (info: RollbackExecutionInfo): Promise<void> => {
+                if (userQuestionsApi) {
+                    const confirmed = await askRollbackConfirmation(userQuestionsApi, exec, info);
+                    if (!confirmed) throw new Error('[DACW] 用户未确认回滚，已取消执行（工作区未改动）');
+                    return;
+                }
+                const token = String(process.env[ROLLBACK_TOKEN_ENV] ?? '').trim();
+                if (!token) {
+                    throw new Error(
+                        `[DACW] 宿主未提供 userQuestions 交互能力，且未设置 ${ROLLBACK_TOKEN_ENV}：拒绝执行回滚（fail-closed）`,
+                    );
+                }
+                logger.info(`DACW: 宿主无交互能力，使用 ${ROLLBACK_TOKEN_ENV} 显式授权执行回滚（task_id=${taskId}）`);
+            };
 
             const stateDir = config.stateDir || path.join(os.tmpdir(), 'dacw-state');
             const result = await rollbackTask(
                 stateDir, taskId, workspaceDir,
                 reason || undefined,
                 resolvedEngineOptions.stateChecksumFn ?? undefined,
+                onBeforeExecute,
             );
             const value = {
                 success: result.success,
