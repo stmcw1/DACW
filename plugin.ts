@@ -1297,6 +1297,14 @@ export function apply(ctx: any, rawConfig?: unknown) {
             const requested = workspaceArg || config.workspace;
             const workspaceDir = await prepareWorkspace(baseDir, requested, config.workspacePolicy);
 
+            const confirm = typeof args.confirm === 'string' ? args.confirm.trim() : '';
+            const expectedConfirm = `ROLLBACK ${taskId} ${workspaceDir}`;
+            if (confirm !== expectedConfirm) {
+                throw new Error(
+                    `[DACW] 回滚是高影响操作。请提供精确确认参数 confirm，值必须为：${expectedConfirm}`,
+                );
+            }
+
             const stateDir = config.stateDir || path.join(os.tmpdir(), 'dacw-state');
             const result = await rollbackTask(
                 stateDir, taskId, workspaceDir,
