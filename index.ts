@@ -787,6 +787,17 @@ export interface RollbackResult {
     message: string;
 }
 
+/** 回滚执行前回调的上下文（供调用方做人工确认 / 二次授权）。 */
+export interface RollbackExecutionInfo {
+    mode: RollbackMode;
+    rollbackPoint: RollbackPoint;
+    workspaceDir: string;
+    taskId: string;
+}
+
+/** 回滚执行前回调：正常返回 → 继续执行；抛错 → 整次回滚中止（不写审计、不改工作区）。 */
+export type RollbackBeforeExecute = (info: RollbackExecutionInfo) => Promise<void>;
+
 /**
  * 执行一次任务回滚（步骤 3）：
  *   - 先验证工作区 `.dacw-workspace` 标记合法，再按 (stateDir, rawTaskId, workspaceDir) 载入状态；
@@ -795,6 +806,8 @@ export interface RollbackResult {
  *     备份保留供审计/重试，不删除）；
  *   - 全部失败路径 fail-closed（success:false + 明确 message），回滚后任务必须终止
  *     （工作区内容 ≠ baseFiles，不变量 1 已破坏），审计写入 status=NEED_HUMAN、lastError=已回滚。
+ *   - 可选 `onBeforeExecute`：在真正执行 git-hint/workspace-restore 之前调用，供调用方做人工确认；
+ *     回调抛错直接冒泡（不写审计、不改工作区、不返回 success）。
  */
 export async function rollbackTask(
     stateDir: string,
@@ -802,6 +815,7 @@ export async function rollbackTask(
     workspaceDir: string,
     reason: string = '用户请求回滚',
     checksumFn?: StateChecksumFn,
+    onBeforeExecute?: RollbackBeforeExecute,
 ): Promise<RollbackResult> {
     const resolvedWorkspace = path.resolve(workspaceDir);
     const resolvedStateDir = path.resolve(stateDir);
@@ -846,6 +860,17 @@ export async function rollbackTask(
     }
     const beforeFiles = Array.from(beforeDigest.keys());
     const at = new Date().toISOString();
+
+    // 4.5 可选执行前回调（人工确认/二次授权）：位置在 beforeFiles 之后、模式分支之前。
+    // 回调抛错直接向上冒泡——不写 rollback 审计、不改工作区、不返回 success。
+    if (typeof onBeforeExecute === 'function') {
+        await onBeforeExecute({
+            mode: rollbackPoint.mode === 'git' ? 'git-hint' : 'workspace-restore',
+            rollbackPoint,
+            workspaceDir,
+            taskId: rawTaskId,
+        });
+    }
 
     let record: RollbackRecord;
     let message: string;
