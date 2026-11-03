@@ -24,7 +24,7 @@ export type WorkflowStatus = 'IDLE' | 'RUNNING' | 'NEED_HUMAN' | 'DONE';
 /** 回滚点类型：git＝任务开始前的 HEAD commit；workspace＝备份目录名。 */
 export type RollbackPointMode = 'git' | 'workspace';
 
-/** 任务开始前捕获的回滚点（用于“一键回滚”）。 */
+/** 任务开始前捕获的回滚点（用于人工触发回滚）。 */
 export interface RollbackPoint {
     /** git：任务开始前的 HEAD commit；workspace：备份目录名。 */
     mode: RollbackPointMode;
