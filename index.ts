@@ -974,8 +974,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     const conversation: ConversationOps = NOOP_CONVERSATION;
     let feedback: string | null = null;
     const files = () => finalFiles ?? Array.from(baseFiles.keys());
+    /** 回滚点是否真实捕获成功（供 dacw_run 结果准确报告 rollback_available）。 */
+    let rollbackPointCaptured = false;
     const finish = (success: boolean, message: string, round: number) =>
-        ({ success, message, status: 'NEED_HUMAN' as const, round, files: files() });
+        ({ success, message, status: 'NEED_HUMAN' as const, round, files: files(), rollbackPointCaptured });
     const abortError = () => {
         const err = new Error('工作流已被取消（调用方中断）');
         (err as any).isAbort = true;
@@ -1037,6 +1039,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
         try {
             const rollbackPoint = await captureRollbackPoint(workspaceDir, STATE_DIR, rawTaskId);
             await stateManager.update((s) => { s.rollbackPoint = rollbackPoint; });
+            rollbackPointCaptured = true;
             logSystem(context, `🔄 回滚点已记录：${rollbackPoint.mode === 'git'
                 ? `git ${rollbackPoint.ref}`
                 : `workspace 备份 ${rollbackPoint.ref}`}`);

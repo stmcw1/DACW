@@ -882,6 +882,7 @@ function renderRollbackResultText(value: any): string {
 }
 
 const ROLLBACK_TOOL_DESCRIPTION =
+    '调用时必须传 confirm: true 表示有意调用。' +
     '回滚 DACW 任务到任务开始前。git 工作区返回回滚指令（DACW 不执行 git 命令）；' +
     '非 git 工作区从备份恢复。回滚需人工触发，执行前会通过宿主 userQuestions 请求人类确认；' +
     '宿主无交互能力且未显式设置 DACW_ROLLBACK_TOKEN 时拒绝执行（fail-closed），回滚后任务终止。' +
@@ -1007,15 +1008,6 @@ export function apply(ctx: any, rawConfig?: unknown) {
     // apply() 开头、任何 ctx.effect 之前：结构性宿主 API 不兼容直接拒绝激活；provider 缺失仅 warn。
     assertHostCompatibility(ctx, config, logger);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
-
-    // B1：探测宿主用户交互能力（回滚执行前需要人类明确确认，属高影响操作）。
-    // 只读探测：服务缺失 → null；dacw_rollback 届时 fail-closed 拒绝执行（绝不静默回滚）。
-    const userQuestionsApi: { ask: (request: any) => Promise<any> } | null = (() => {
-        try {
-            const svc = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined;
-            return svc && typeof svc.ask === 'function' ? svc : null;
-        } catch { return null; }
-    })();
 
     // 引擎配置在插件实例内解析一次：dacw_run（写入状态）与 dacw_rollback（读取状态）必须使用
     // 同一个 stateChecksumFn，否则回滚验签必然失败。函数类型无法从 YAML 解析，插件路径恒为
@@ -1290,12 +1282,12 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 workspace: workspaceDir,
                 models: roleModelLabels,
                 round: typeof result.round === 'number' ? result.round : 0,
-                files: Array.isArray(result.files) ? result.files.map(String) : [],
-                logs: tailLogs(logs, 60, 8000),
-                elapsed_ms: Date.now() - startedAt,
-                task_id: rawTaskId,
-                rollback_available: true,
-            };
+                    files: Array.isArray(result.files) ? result.files.map(String) : [],
+                    logs: tailLogs(logs, 60, 8000),
+                    elapsed_ms: Date.now() - startedAt,
+                    task_id: rawTaskId,
+                    rollback_available: result.rollbackPointCaptured === true,
+                };
             if (!value.success) {
                 const failure = new Error(
                     `[DACW] 工作流未通过（status=${value.status}，round=${value.round}）：${value.message}\n` +
@@ -1317,8 +1309,12 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 task_id: { type: 'string', description: '要回滚的任务 ID（dacw_run 返回的 task_id）。' },
                 workspace: { type: 'string', description: '可选，dacw_run 时使用的工作区；省略则用配置的 workspace，再退回当前会话工作目录。' },
                 reason: { type: 'string', description: '可选，回滚原因，记录到审计，限 500 字符。' },
+                confirm: {
+                    type: 'boolean',
+                    description: '必填。传 true 表示有意调用回滚（高影响操作，必须显式确认）。',
+                },
             },
-            required: ['task_id'],
+            required: ['task_id', 'confirm'],
             additionalProperties: false,
         },
         output: {
@@ -1343,6 +1339,15 @@ export function apply(ctx: any, rawConfig?: unknown) {
             if (!taskId) throw new Error('[DACW] 参数 task_id 必须是非空字符串');
             if (taskId.length > MAX_TASK_ID_CHARS) throw new Error(`[DACW] task_id 过长（${taskId.length} > ${MAX_TASK_ID_CHARS}）`);
 
+            // C3：高影响操作必须显式传 confirm: true；校验在 prepareWorkspace 之前（不触碰文件系统）。
+            if (args.confirm !== true) {
+                throw new Error(
+                    '[DACW] 回滚是高影响操作。请传 confirm: true 表示有意调用。\n'
+                    + 'git 工作区：返回回滚指令，不修改文件。\n'
+                    + '非 git 工作区：执行前会请求人工交互确认；宿主无交互能力时需设置 DACW_ROLLBACK_TOKEN。',
+                );
+            }
+
             const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
             if (reason.length > 500) throw new Error(`[DACW] reason 过长（${reason.length} > 500）`);
 
@@ -1354,6 +1359,14 @@ export function apply(ctx: any, rawConfig?: unknown) {
             if (isDacwChild(agent)) throw new Error('[DACW] 禁止在 DACW 子代理内调用 dacw_rollback');
 
             const signal: AbortSignal | undefined = exec && exec.signal ? exec.signal : undefined;
+            // 每次调用时探测（与 dacw_run 的 askUserQuestion 一致）：避免 apply() 时服务
+            // 加载顺序晚于 DACW 导致永久降级到 token 路径。
+            const userQuestionsApi: { ask: (request: any) => Promise<any> } | null = (() => {
+                try {
+                    const svc = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined;
+                    return svc && typeof svc.ask === 'function' ? svc : null;
+                } catch { return null; }
+            })();
             // 必须与 dacw_run 使用同一个 callerWorkingDirectory / prepareWorkspace / config.workspace 解析：
             // StateManager 构造时 rawTaskId + workspaceDir 参与哈希，路径不一致就找不到状态文件。
             const baseDir = await callerWorkingDirectory(agent, signal);
