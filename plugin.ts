@@ -23,7 +23,7 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { apply as createEngine } from './index';
+import { apply as createEngine, isValidWorkspaceMarker } from './index';
 import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
 import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
@@ -32,8 +32,6 @@ const WRITER_PRESET_ID = 'dacw-writer';
 const REVIEWER_PRESET_ID = 'dacw-reviewer';
 const WORKSPACE_MARKER = '.dacw-workspace';
 const WORKSPACE_MARKER_MANAGED_BY = '@stmcw1/dacw';
-/** 0.1 时代的包名：保留对旧标记的兼容，避免升级后既有工作区无法继续使用。 */
-const LEGACY_WORKSPACE_MARKER_MANAGED_BY = '@local/dacw';
 const WORKSPACE_MARKER_CONTENT =
     `{"managedBy":"${WORKSPACE_MARKER_MANAGED_BY}","version":"${PLUGIN_VERSION}",` +
     `"note":"DACW resets non-foundation files in this directory every round. Remove this marker to revoke that."}\n`;
@@ -751,22 +749,9 @@ export async function runSubagentChat(options: {
 // ================= 工作区准备与安全闸门 =================
 const PROTECTED_WORKSPACE_ENTRIES = new Set([WORKSPACE_MARKER, 'node_modules', '.git']);
 
-/**
- * 校验 `.dacw-workspace` 标记内容：必须是本插件写入的 JSON（managedBy 匹配）。
- * 仅凭文件名接受标记会让任何带同名文件的目录通过安全闸门，因此必须校验内容。
- * 兼容 0.1 时代的旧包名 `@local/dacw`，避免重命名后既有工作区失效。纯函数。
- */
-export function isValidWorkspaceMarker(content: unknown): boolean {
-    if (typeof content !== 'string' || content.trim() === '') return false;
-    try {
-        const parsed = JSON.parse(content);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-        const managedBy = (parsed as Record<string, unknown>).managedBy;
-        return managedBy === WORKSPACE_MARKER_MANAGED_BY || managedBy === LEGACY_WORKSPACE_MARKER_MANAGED_BY;
-    } catch {
-        return false;
-    }
-}
+// 标记校验的唯一事实来源在 index.ts（rollbackTask 也要用，避免 plugin↔index 循环依赖）；
+// 这里 re-export 以保持既有调用方（含回归自测）的导入路径不变。
+export { isValidWorkspaceMarker };
 
 /** child 是否等于 parent 或位于其内部（路径均已解析；Windows 大小写不敏感由 path.relative 处理）。 */
 function isSameOrInside(parent: string, child: string): boolean {

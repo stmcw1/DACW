@@ -27,12 +27,33 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { Runner } from './runner';
 import { StateManager } from './state_manager';
-import type { RollbackPoint } from './state_manager';
+import type { RollbackPoint, RollbackRecord, RollbackMode } from './state_manager';
 import { DEFAULT_SANDBOX_CONFIG, buildSandboxConsentRequest, describePolicy, detectDocker, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
 import type { ExecutionPolicy, SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 import { scanWriterOutputForSecrets } from './secrets';
 
 const execFileAsync = promisify(execFile);
+
+/** `.dacw-workspace` 标记文件的合法 managedBy 值（与 plugin 写入侧保持一致；兼容 0.1 旧包名）。 */
+const WORKSPACE_MARKER_MANAGED_BY = '@stmcw1/dacw';
+const LEGACY_WORKSPACE_MARKER_MANAGED_BY = '@local/dacw';
+
+/**
+ * 校验 `.dacw-workspace` 标记内容：必须是本插件写入的 JSON（managedBy 匹配）。
+ * 仅凭文件名接受标记会让任何带同名文件的目录通过安全闸门，因此必须校验内容。
+ * 纯函数；plugin.ts 复用并 re-export 此实现（唯一事实来源）。
+ */
+export function isValidWorkspaceMarker(content: unknown): boolean {
+    if (typeof content !== 'string' || content.trim() === '') return false;
+    try {
+        const parsed = JSON.parse(content);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+        const managedBy = (parsed as Record<string, unknown>).managedBy;
+        return managedBy === WORKSPACE_MARKER_MANAGED_BY || managedBy === LEGACY_WORKSPACE_MARKER_MANAGED_BY;
+    } catch {
+        return false;
+    }
+}
 
 // B 组的纯函数由 secrets.ts 提供（与 C 组运行机脱敏共用同一套模式），此处保留导出以兼容既有调用方。
 export { scanWriterOutputForSecrets };
@@ -754,8 +775,145 @@ export async function captureRollbackPoint(
     return { mode: 'workspace', ref: backupKey, capturedAt };
 }
 
+/** 回滚执行结果。 */
+export interface RollbackResult {
+    success: boolean;
+    mode: RollbackMode | null;
+    record: RollbackRecord | null;
+    message: string;
+}
+
+/**
+ * 执行一次任务回滚（步骤 3）：
+ *   - 先验证工作区 `.dacw-workspace` 标记合法，再按 (stateDir, rawTaskId, workspaceDir) 载入状态；
+ *   - git 模式只返回命令提示（DACW 不执行任何 git 命令，绝不自动 reset/clean）；
+ *   - workspace 模式从任务开始前的备份恢复（`safeCleanWorkspace` 语义 + 捕获时同款过滤规则；
+ *     备份保留供审计/重试，不删除）；
+ *   - 全部失败路径 fail-closed（success:false + 明确 message），回滚后任务必须终止
+ *     （工作区内容 ≠ baseFiles，不变量 1 已破坏），审计写入 status=NEED_HUMAN、lastError=已回滚。
+ */
+export async function rollbackTask(
+    stateDir: string,
+    rawTaskId: string,
+    workspaceDir: string,
+    reason: string = '用户请求回滚',
+): Promise<RollbackResult> {
+    const resolvedWorkspace = path.resolve(workspaceDir);
+    const resolvedStateDir = path.resolve(stateDir);
+    const fail = (message: string, mode: RollbackMode | null = null, record: RollbackRecord | null = null): RollbackResult =>
+        ({ success: false, mode, record, message });
+
+    // 1. 验证工作区标记
+    let markerContent: string | null = null;
+    try {
+        markerContent = await fs.readFile(path.join(resolvedWorkspace, '.dacw-workspace'), 'utf8');
+    } catch {
+        markerContent = null;
+    }
+    if (!isValidWorkspaceMarker(markerContent)) {
+        return fail('工作区无合法 DACW 标记，拒绝回滚');
+    }
+
+    // 2. 载入状态（rawTaskId + workspaceDir 参与状态文件名哈希 → 路径不一致天然找不到，防错配）
+    const stateManager = new StateManager(resolvedStateDir, rawTaskId, resolvedWorkspace);
+    let state;
+    try {
+        state = await stateManager.load();
+    } catch (e: any) {
+        return fail(`状态文件校验失败，拒绝回滚：${e?.message ?? String(e)}`);
+    }
+    if (state === null) {
+        return fail(`未找到任务 ${rawTaskId} 的状态记录`);
+    }
+
+    // 3. 回滚点
+    const rollbackPoint = state.rollbackPoint;
+    if (!rollbackPoint) {
+        return fail('该任务未记录回滚点（可能在回滚点捕获失败后终止，或无回滚能力）');
+    }
+
+    // 4. 回滚前文件清单
+    let beforeDigest: Map<string, string>;
+    try {
+        beforeDigest = await enumerateWorkspace(resolvedWorkspace);
+    } catch (e: any) {
+        return fail(`回滚前枚举工作区失败，拒绝回滚：${e?.message ?? String(e)}`);
+    }
+    const beforeFiles = Array.from(beforeDigest.keys());
+    const at = new Date().toISOString();
+
+    let record: RollbackRecord;
+    let message: string;
+
+    if (rollbackPoint.mode === 'git') {
+        // 5a. git 模式：只给提示，不执行任何 git 命令。
+        const hint = [
+            `git reset --hard ${rollbackPoint.ref}`,
+            '',
+            '# 注意：本次任务可能新增了未跟踪文件，reset --hard 不会删除它们。',
+            '# 如需清理，手动执行以下命令——它会删除工作区内所有未跟踪文件（含你自己创建的）：',
+            '# git clean -fd',
+        ].join('\n');
+        record = {
+            at, reason, mode: 'git-hint', rollbackPoint: rollbackPoint.ref,
+            beforeFiles, afterFiles: beforeFiles, executed: false, hint,
+        };
+        message = `检测到 git 仓库。DACW 不执行 git 命令，请手动回滚：\n${hint}\n\n`
+            + `回滚点：${rollbackPoint.ref}\n捕获时间：${rollbackPoint.capturedAt}`;
+    } else {
+        // 5b. workspace 模式：从备份恢复。
+        const backupDir = path.join(resolvedStateDir, 'backup', rollbackPoint.ref);
+        if (!fsSync.existsSync(backupDir)) {
+            return fail(`备份目录不存在（可能已被清理）：${backupDir}`);
+        }
+        try {
+            await safeCleanWorkspace(resolvedWorkspace);
+            await fs.cp(backupDir, resolvedWorkspace, {
+                recursive: true,
+                filter: (src: string) => {
+                    const base = path.basename(src);
+                    return base !== '.git' && base !== 'node_modules' && base !== '.dacw-workspace';
+                },
+            });
+        } catch (e: any) {
+            return fail(`从备份恢复失败（工作区可能处于半恢复状态，需人工检查）：${e?.message ?? String(e)}`,
+                'workspace-restore');
+        }
+        let afterFiles: string[];
+        try {
+            afterFiles = Array.from((await enumerateWorkspace(resolvedWorkspace)).keys());
+        } catch (e: any) {
+            return fail(`回滚后枚举工作区失败（工作区已恢复，需人工检查）：${e?.message ?? String(e)}`,
+                'workspace-restore');
+        }
+        // 备份保留供审计与重试，不删除。
+        record = {
+            at, reason, mode: 'workspace-restore', rollbackPoint: rollbackPoint.ref,
+            beforeFiles, afterFiles, executed: true,
+        };
+        message = `已从工作区备份回滚 ${beforeFiles.length} → ${afterFiles.length} 个文件；`
+            + `备份目录保留供审计/重试：${backupDir}`;
+    }
+
+    // 6. 写审计：回滚后任务必须终止（工作区内容 ≠ baseFiles）。
+    try {
+        await stateManager.update((s) => {
+            s.rollback = record;
+            s.status = 'NEED_HUMAN';
+            s.lastError = '已回滚，任务终止';
+        });
+    } catch (e: any) {
+        return fail(`${message}\n但回滚审计写入失败（工作区已${record.executed ? '回滚' : '未变更'}）：${e?.message ?? String(e)}`,
+            record.mode, record);
+    }
+
+    // 7. 成功
+    return { success: true, mode: record.mode, record, message };
+}
+
 /** 按“送入模型的总字符数”计算自适应聊天超时（写手按基线、审查者按送审 payload）。 */
-function chatTimeoutForChars(totalChars: number, options: EngineOptions): number {    const extra = Math.floor(totalChars / 10_000) * options.chatTimeoutPer10kCharsMs;
+function chatTimeoutForChars(totalChars: number, options: EngineOptions): number {
+    const extra = Math.floor(totalChars / 10_000) * options.chatTimeoutPer10kCharsMs;
     return Math.min(options.chatTimeoutBaseMs + extra, options.chatTimeoutMaxMs);
 }
 
@@ -770,8 +928,11 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     logSystem(context, '启动 DACW (防御性智能体编程工作流, 输出协议 v2)...');
     logModelConfig(context, options.roleModels);
     const STATE_DIR = options.stateDir ?? path.join(os.tmpdir(), 'dacw-state');
-    const RUN_KEY = crypto.randomBytes(32);
-    const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir, RUN_KEY);
+    // 状态文件使用确定性 SHA-256 校验（不带每次运行随机生成的 HMAC 密钥）：
+    // 一键回滚是跨工具调用/跨进程的终态操作，必须能重新载入并验证同一份状态文件；
+    // 随机密钥只存在于原运行内存中，回滚侧无法复现（此前会导致校验必然失败）。
+    // 安全语义：防意外损坏与手滑改写，不防同账号本地用户重算签名（与审计日志边界一致）。
+    const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir);
 
     // 沙盒策略在 stateManager.init 之后解析：blocked 时需要记录 NEED_HUMAN 状态并等待人类确认。
     let sandboxPlan: ExecutionPolicy;

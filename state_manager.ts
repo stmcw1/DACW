@@ -22,6 +22,25 @@ export interface RollbackPoint {
     capturedAt: string;
 }
 
+/** 回滚执行方式：git-hint＝只给命令提示不执行 git；workspace-restore＝DACW 从备份恢复。 */
+export type RollbackMode = 'git-hint' | 'workspace-restore';
+
+/** 回滚审计记录（写入 WorkflowState.rollback）。 */
+export interface RollbackRecord {
+    at: string;
+    reason: string;
+    mode: RollbackMode;
+    /** git：commit hash；workspace：备份目录名。 */
+    rollbackPoint: string;
+    beforeFiles: string[];
+    /** git-hint 模式下与 beforeFiles 相同（DACW 未动工作区）。 */
+    afterFiles: string[];
+    /** git-hint: false；workspace-restore: true。 */
+    executed: boolean;
+    /** git-hint 模式给用户的命令提示。 */
+    hint?: string;
+}
+
 
 export interface WorkflowState {
     taskId: string;
@@ -37,6 +56,8 @@ export interface WorkflowState {
     secretScanHits: string[] | null;
     /** 任务开始前捕获的回滚点；null 表示未捕获（例如非 git 工作区且备份失败）。 */
     rollbackPoint: RollbackPoint | null;
+    /** 回滚审计记录（git-hint 或 workspace-restore）；null 表示未回滚。 */
+    rollback: RollbackRecord | null;
     lastError: string | null;      
 }
 
@@ -52,6 +73,7 @@ interface PersistedState {
     reviewExcluded: string[] | null;
     secretScanHits: string[] | null;
     rollbackPoint: RollbackPoint | null;
+    rollback: RollbackRecord | null;
     lastError: string | null;
     checksum: string;
 }
@@ -99,12 +121,13 @@ export class StateManager {
     }
 
     private checksumOf(state: WorkflowState): string {
-        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, rollbackPoint, lastError } = state;
+        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, rollbackPoint, rollback, lastError } = state;
         const body = JSON.stringify({
             taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
             reviewExcluded: reviewExcluded ?? null,
             secretScanHits: secretScanHits ?? null,
             rollbackPoint: rollbackPoint ?? null,
+            rollback: rollback ?? null,
             lastError,
         });
         return this.macOf(body);
@@ -172,7 +195,7 @@ export class StateManager {
             const initial: WorkflowState = {
                 taskId: this.taskId, round: 1, status: 'RUNNING', taskPrompt,
                 writtenFiles: null, testResult: null, reviewResult: null,
-                reviewExcluded: null, secretScanHits: null, rollbackPoint: null, lastError: null
+                reviewExcluded: null, secretScanHits: null, rollbackPoint: null, rollback: null, lastError: null
             };
             await this.persist(initial);
             this.authoritative = initial;

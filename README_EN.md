@@ -28,7 +28,7 @@ DACW is a **DSH Host plugin**: a writer subagent emits code changes under an inc
 - **Structured review**: the verdict must be exact JSON; unparseable output is treated as REJECTED; PASS containing suspicious wording goes to the human gate.
 - **Configurable models**: writer/reviewer can each inherit the parent session route or select from the DSH configured-model directory; the startup log and the result object show the models actually in effect.
 - **Workspace safety gate**: accepts only an empty directory or a valid `.dacw-workspace` marker written by this plugin; refuses filesystem roots, the user home directory, and `DSH_HOME`/profile directories; writes are checked with realpath plus per-segment symlink checks.
-- **Audit record**: the state file records the task, file manifest summary, test output and review text, signed with HMAC-SHA256.
+- **Audit record**: the state file records the task, file manifest summary, test output and review text, verified with SHA-256 (guards against accidental corruption/edits; not against a same-account local user recomputing it — same boundary as audit logs).
 
 > **Trust boundary**: tests execute before any review, so review is a detective control, not a preventive one; child tool isolation is not a code-execution security boundary. See [SAFETY_EN.md](SAFETY_EN.md).
 
@@ -54,7 +54,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 112 regression vectors
+node selftest.mjs                           # 114 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -160,7 +160,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 | `index.ts` | Orchestrator: rounds, baseline merge, runner dispatch, verdict, human gate |
 | `sandbox.ts` | Sandbox policy: host (default)/auto/docker decision, container args, Docker detection, auto-downgrade consent request |
 | `runner.ts` | Runner: command resolution, timeout tree-kill, output truncation |
-| `state_manager.ts` | State: atomic writes, HMAC, serial queue |
+| `state_manager.ts` | State: atomic writes, SHA-256 verification, serial queue |
 | `build.mjs` / `selftest.mjs` | Build (TS → `dist/`) and regression self-test |
 | `cordis.patch.yml` / `locale/` / `icon.png` | Plugin manifest and display resources |
 

@@ -24,7 +24,7 @@ const { redactSecretsInText } = secretsModule;
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
     enumerateWorkspace, diffDigest, fingerprintProtectedDirs, isSensitiveReviewFile, scanWriterOutputForSecrets,
-    captureRollbackPoint,
+    captureRollbackPoint, rollbackTask,
 } = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
@@ -798,6 +798,8 @@ try {
     const runReconWorkflow = async (tag, scriptBody, prepare, reviewerAction, extraOptions, askUserQuestion, writerChanged) => {
         const binDir = await makeFakeNpm(`fake-npm-${tag}`, scriptBody);
         const wsDir = path.join(tmpRoot, `ws-recon-${tag}`);
+        const stateDir = path.join(tmpRoot, `state-recon-${tag}`);
+        const taskId = `selftest-recon-${tag}`;
         await fs.mkdir(wsDir, { recursive: true });
         await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }), 'utf8');
         if (prepare) await prepare(wsDir);
@@ -826,14 +828,14 @@ try {
             };
             const execute = engine.apply(context, {
                 maxRounds: 1,
-                stateDir: path.join(tmpRoot, `state-recon-${tag}`),
+                stateDir,
                 // 回归测试默认显式走宿主策略，避免依赖本机 Docker 是否存在；
                 // 沙盒确认流程的用例会通过 extraOptions 覆盖 sandbox/sandboxDetect。
                 sandbox: { mode: 'host' },
                 ...(extraOptions ?? {}),
             });
-            const result = await execute(`selftest-recon-${tag}`, wsDir, 'task');
-            return { result, reviewerCalled, reviewerInput, logs, writerContexts };
+            const result = await execute(taskId, wsDir, 'task');
+            return { result, reviewerCalled, reviewerInput, logs, writerContexts, wsDir, stateDir, taskId };
         } finally {
             process.env.PATH = prevPath;
         }
@@ -1035,6 +1037,76 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.equal(detected, false);
         assert.equal(asked, false);
         assert.equal(result.success, true);
+    });
+    await ta('回滚执行：git 模式只给命令提示，不执行 git、不改工作区', async () => {
+        const prepare = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, '.dacw-workspace'),
+                JSON.stringify({ managedBy: '@stmcw1/dacw', version: '1.1.0' }) + '\n', 'utf8');
+            const git = (args) => execFileAsync('git', args, { cwd: wsDir, windowsHide: true });
+            await git(['init', '-q']);
+            await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'add', '-A']);
+            await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'commit', '-q', '-m', 'init']);
+        };
+        const run = await runReconWorkflow('rollback-git', 'process.exit(0);', prepare);
+        assert.equal(run.result.success, true, run.result.message);
+        const beforeDigest = await enumerateWorkspace(run.wsDir);
+        const res = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'git-hint');
+        eq(res.record.executed, false);
+        assert.match(res.record.hint, /git reset --hard [0-9a-f]{7,40}/);
+        assert.match(res.record.hint, /git clean -fd/);
+        assert.match(res.message, /DACW 不执行 git 命令/);
+        assert.ok(res.record.beforeFiles.length > 0, JSON.stringify(res.record.beforeFiles));
+        eq(res.record.afterFiles, res.record.beforeFiles);
+        // 工作区未被改动（逐文件摘要一致）
+        const afterDigest = await enumerateWorkspace(run.wsDir);
+        eq(Object.fromEntries(afterDigest), Object.fromEntries(beforeDigest));
+        // 审计记录已写入状态文件
+        const stateName = (await fs.readdir(run.stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(run.stateDir, stateName), 'utf8'));
+        eq(persisted.rollback.mode, 'git-hint');
+        eq(persisted.rollback.executed, false);
+        eq(persisted.status, 'NEED_HUMAN');
+        eq(persisted.lastError, '已回滚，任务终止');
+    });
+    await ta('回滚执行：workspace 模式从备份恢复、清理新增文件、备份保留', async () => {
+        const prepare = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, '.dacw-workspace'),
+                JSON.stringify({ managedBy: '@stmcw1/dacw', version: '1.1.0' }) + '\n', 'utf8');
+            await fs.writeFile(path.join(wsDir, 'seed.txt'), 'seed\n', 'utf8');
+        };
+        const run = await runReconWorkflow('rollback-ws', 'process.exit(0);', prepare);
+        assert.equal(run.result.success, true, run.result.message);
+        assert.ok(run.result.files.includes('main.js'), JSON.stringify(run.result.files));
+        const res = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'workspace-restore');
+        eq(res.record.executed, true);
+        assert.ok(res.record.beforeFiles.includes('main.js'), JSON.stringify(res.record.beforeFiles));
+        const afterDigest = await enumerateWorkspace(run.wsDir);
+        const afterKeys = Array.from(afterDigest.keys());
+        eq(afterKeys, res.record.afterFiles);
+        assert.ok(!afterKeys.includes('main.js'), '写手新增文件应被清理：' + JSON.stringify(afterKeys));
+        assert.ok(afterKeys.includes('seed.txt'), JSON.stringify(afterKeys));
+        assert.ok(afterKeys.includes('package.json'), JSON.stringify(afterKeys));
+        // 标记文件仍在（safeCleanWorkspace 保护；捕获备份过滤它）
+        const marker = await fs.readFile(path.join(run.wsDir, '.dacw-workspace'), 'utf8');
+        assert.equal(JSON.parse(marker).managedBy, '@stmcw1/dacw');
+        // 备份保留供审计/重试
+        await fs.stat(path.join(run.stateDir, 'backup', res.record.rollbackPoint));
+        // 审计记录
+        const stateName = (await fs.readdir(run.stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(run.stateDir, stateName), 'utf8'));
+        eq(persisted.rollback.mode, 'workspace-restore');
+        eq(persisted.rollback.executed, true);
+        eq(persisted.lastError, '已回滚，任务终止');
+        // 边界：无合法标记的工作区 → 拒绝回滚
+        const noMarkerWs = path.join(tmpRoot, 'rollback-nomarker');
+        await fs.mkdir(noMarkerWs, { recursive: true });
+        const rejected = await rollbackTask(run.stateDir, run.taskId, noMarkerWs);
+        eq(rejected.success, false);
+        assert.match(rejected.message, /工作区无合法 DACW 标记/);
     });
     await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
         const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(

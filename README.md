@@ -28,7 +28,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 - **结构化审查**：裁决必须为精确 JSON，解析失败按 REJECTED 处理；PASS 但含可疑字样 → 人工闸门。
 - **可配置模型**：写手/审查者可分别继承父会话路由，或从 DSH 已配置模型目录中选择；启动日志与结果对象显示实际生效的模型。
 - **工作区安全闸门**：仅接受空目录或本插件写入的合法 `.dacw-workspace` 标记；拒绝系统根、用户主目录、`DSH_HOME`/profile 目录；写入前做 realpath + 逐段符号链接校验。
-- **审计记录**：状态文件包含任务、文件清单摘要、测试输出与审查文本，HMAC-SHA256 签名。
+- **审计记录**：状态文件包含任务、文件清单摘要、测试输出与审查文本，SHA-256 校验（防意外损坏/手滑改写；不防同账号本地用户重算，与审计日志边界一致）。
 
 > **信任边界**：测试在审查之前执行，审查是侦探性控制而非预防性控制；子代理工具隔离不是代码执行的安全边界。详见 [SAFETY.md](SAFETY.md)。
 
@@ -54,7 +54,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 112 项回归自测
+node selftest.mjs                           # 114 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
@@ -160,7 +160,7 @@ DACW 会执行模型生成的代码与命令。**测试在审查之前执行**�
 | `index.ts` | 协调器：轮次、基线合并、运行机调度、裁决、人工闸门 |
 | `sandbox.ts` | 沙箱策略层：host（默认）/auto/docker 决策、容器参数、Docker 探测、auto 降级确认请求 |
 | `runner.ts` | 运行机：命令解析、超时强杀、输出截断 |
-| `state_manager.ts` | 状态：原子写、HMAC、串行队列 |
+| `state_manager.ts` | 状态：原子写、SHA-256 校验、串行队列 |
 | `build.mjs` / `selftest.mjs` | 构建（TS → `dist/`）与回归自测 |
 | `cordis.patch.yml` / `locale/` / `icon.png` | 插件清单与展示资源 |
 
