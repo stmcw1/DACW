@@ -76,7 +76,7 @@
 - [ ] 审计导出：导出本地审计包供外包/客户查看。
 - [ ] 策略快照：记录当前配置基于哪套默认值。
 - [ ] 配置按任务边界生效：运行中不热切换。
-- [ ] 仅本地模型模式：敏感项目禁用云端 API。
+- [ ] 模型来源白名单：限制 `writerModel`/`reviewerModel` 只能解析到指定 provider 列表（如仅本地），解析到列表外 provider 时 fail-closed 拒绝运行。
 - [ ] 上下文最小化策略：只发必要片段。
 - [ ] 本地模型接入：通过 DSH Custom model API 将 `writerModel`/`reviewerModel` 指向本地模型（Ollama / LM Studio / vLLM）。DACW 侧透传 `provider/model`，无需改代码。注意：本地小模型能力弱于云端，fail-closed 转人工会更频繁，属预期行为。
 
