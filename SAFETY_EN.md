@@ -51,7 +51,7 @@ Container constraints in docker mode: `--network none` (no network), read-only r
 
 **docker mode is not perfect isolation either**: containers share the host kernel, the image must be trusted (use only official or reviewed images), and the Docker Desktop file-sharing layer has its own attack surface; pre-pull the image before first use or the pull time may trip the test timeout.
 
-With the default host mode (or when the user confirms disabling the sandbox under `auto`), arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user; the result message is flagged as a security downgrade / states where tests executed, and the log carries a red warning. In host mode the command whitelist, environment whitelist, HMAC signing, review and human gate reduce risk but **do not constitute isolation**; do not treat DACW as the sole security control for untrusted workloads.
+With the default host mode (or when the user confirms disabling the sandbox under `auto`), arbitrary writer-produced code (including `package.json` test/pretest scripts) runs with the full privileges of the host user; the result message is flagged as a security downgrade / states where tests executed, and the log carries a red warning. In host mode the command whitelist, environment whitelist, state-file checksum, review and human gate reduce risk but **do not constitute isolation**; do not treat DACW as the sole security control for untrusted workloads.
 
 ## Key boundaries
 

@@ -27,7 +27,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { Runner } from './runner';
 import { StateManager } from './state_manager';
-import type { RollbackPoint, RollbackRecord, RollbackMode } from './state_manager';
+import type { RollbackPoint, RollbackRecord, RollbackMode, StateChecksumFn } from './state_manager';
 import { DEFAULT_SANDBOX_CONFIG, buildSandboxConsentRequest, describePolicy, detectDocker, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
 import type { ExecutionPolicy, SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 import { scanWriterOutputForSecrets } from './secrets';
@@ -107,6 +107,8 @@ export interface EngineOptions {
     allowTruncatedReview: boolean;
     /** 写手输出秘密扫描（默认开启）：命中凭据模式时记录审计并按处置规则处理；false 显式关闭（降低安全保证）。 */
     secretScanEnabled: boolean;
+    /** 状态校验函数注入点；null → 内置 SHA-256。（函数类型无法从 YAML 解析，仅对直接 apply() 的调用方开放） */
+    stateChecksumFn: StateChecksumFn | null;
     /** 沙盒探测函数（回归测试 / 宿主自定义）；null 表示使用内置 detectDocker。 */
     sandboxDetect: SandboxDetector | null;
 }
@@ -127,6 +129,7 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
     sandboxExplicit: false,
     allowTruncatedReview: false,
     secretScanEnabled: true,
+    stateChecksumFn: null,
     sandboxDetect: null,
 };
 
@@ -160,6 +163,7 @@ export function resolveEngineOptions(partial?: Partial<EngineOptions> | null): E
         sandboxExplicit: partial.sandboxExplicit === true,
         allowTruncatedReview: partial.allowTruncatedReview === true,
         secretScanEnabled: partial.secretScanEnabled !== false,
+        stateChecksumFn: typeof partial.stateChecksumFn === 'function' ? partial.stateChecksumFn : null,
         sandboxDetect: typeof partial.sandboxDetect === 'function' ? partial.sandboxDetect : null,
     };
 }
@@ -797,6 +801,7 @@ export async function rollbackTask(
     rawTaskId: string,
     workspaceDir: string,
     reason: string = '用户请求回滚',
+    checksumFn?: StateChecksumFn,
 ): Promise<RollbackResult> {
     const resolvedWorkspace = path.resolve(workspaceDir);
     const resolvedStateDir = path.resolve(stateDir);
@@ -815,7 +820,7 @@ export async function rollbackTask(
     }
 
     // 2. 载入状态（rawTaskId + workspaceDir 参与状态文件名哈希 → 路径不一致天然找不到，防错配）
-    const stateManager = new StateManager(resolvedStateDir, rawTaskId, resolvedWorkspace);
+    const stateManager = new StateManager(resolvedStateDir, rawTaskId, resolvedWorkspace, checksumFn);
     let state;
     try {
         state = await stateManager.load();
@@ -928,11 +933,10 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
     logSystem(context, '启动 DACW (防御性智能体编程工作流, 输出协议 v2)...');
     logModelConfig(context, options.roleModels);
     const STATE_DIR = options.stateDir ?? path.join(os.tmpdir(), 'dacw-state');
-    // 状态文件使用确定性 SHA-256 校验（不带每次运行随机生成的 HMAC 密钥）：
-    // 一键回滚是跨工具调用/跨进程的终态操作，必须能重新载入并验证同一份状态文件；
-    // 随机密钥只存在于原运行内存中，回滚侧无法复现（此前会导致校验必然失败）。
-    // 安全语义：防意外损坏与手滑改写，不防同账号本地用户重算签名（与审计日志边界一致）。
-    const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir);
+    // 状态校验默认确定性 SHA-256（跨调用可验证）；需要更强防篡改能力时由调用方注入
+    // stateChecksumFn（如外部密钥 HMAC）。回滚必须使用与写入时相同的 checksumFn，
+    // 因此 runWorkflow 与 rollbackTask 的注入点必须一致（plugin 从 resolveEngineOptions 结果透传）。
+    const stateManager = new StateManager(STATE_DIR, rawTaskId, workspaceDir, options.stateChecksumFn ?? undefined);
 
     // 沙盒策略在 stateManager.init 之后解析：blocked 时需要记录 NEED_HUMAN 状态并等待人类确认。
     let sandboxPlan: ExecutionPolicy;

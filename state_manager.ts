@@ -2,10 +2,22 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
 
-// 单实例假设：writeChain 仅提供进程内互斥。多进程/多会话对同一 taskId 并发
-// 写入时为 last-writer-wins，checksum/HMAC 无法检测丢失更新。
-// 当前部署形态（DSH 插件内单协调器 + workspaceLocks 串行化）满足该假设；
-// 若未来多进程并发，需引入文件锁（O_EXCL 锁文件或等价物），属架构层变更。
+/**
+ * 状态校验：默认确定性 SHA-256——防意外损坏、防手滑改写，不防同账号本地用户
+ * 重算（状态文件与进程同账号可读，重算 checksum 无门槛）。
+ *
+ * 需要更强防篡改能力的调用方可通过 checksumFn 注入自定义校验函数（如基于外部
+ * 密钥源的 HMAC）：DACW 核心不 import 任何第三方签名库，注入函数的正确性与
+ * 密钥管理由调用方负责，DACW 不验证、不感知其实现。
+ *
+ * 单实例假设：writeChain 仅提供进程内互斥。多进程/多会话对同一 taskId 并发
+ * 写入时为 last-writer-wins，checksum 无法检测丢失更新。
+ * 当前部署形态（DSH 插件内单协调器 + workspaceLocks 串行化）满足该假设；
+ * 若未来多进程并发，需引入文件锁（O_EXCL 锁文件或等价物），属架构层变更。
+ */
+
+/** 状态校验函数：输入校验串 body，输出 checksum。默认内置 SHA-256。 */
+export type StateChecksumFn = (body: string) => string;
 
 export type WorkflowStatus = 'IDLE' | 'RUNNING' | 'NEED_HUMAN' | 'DONE';
 
@@ -82,42 +94,30 @@ export class StateManager {
     private stateDir: string;
     private stateFilePath: string;
     private taskId: string;
-    private readonly macSecret: string | Buffer | null;
+    private readonly checksumFn: StateChecksumFn;
 
     private writeChain: Promise<unknown> = Promise.resolve();
     private authoritative: WorkflowState | null = null;
     private tmpSeq = 0;
 
     /**
-     * macSecret：提供时使用 HMAC-SHA256 校验。
-     * 运行机里执行的写手代码与协调器同用户同权限，可写 os.tmpdir()；
-     * 无密钥 SHA256 只能防意外损坏，防不了"篡改后重算 checksum"——
-     * 不提供密钥时只能声称防损坏，不得声称防篡改。
-     * 密钥仅存在于协调器内存，且不会经运行机的 env 白名单透传。
-     * 注意：密钥为每次运行随机生成时，跨进程/跨重启的 load() 将无法通过校验；
-     * 当前协调器按单次运行使用状态文件（见协调器 [P2-1] 注释），不受影响。
+     * checksumFn：状态校验函数（省略 → 内置确定性 SHA-256）。
+     * 回滚等跨调用场景必须使用与写入时相同的 checksumFn，否则验签失败。
      *
      * rawTaskId 先消毒、再附加其 SHA256 短哈希作为文件名后缀：
      * "task/1" 与 "task_1" 消毒后同为 "task_1"，哈希后缀消除该碰撞。
      */
-    constructor(stateDir: string, rawTaskId: string, workspaceDir: string, macSecret?: string | Buffer) {
+    constructor(stateDir: string, rawTaskId: string, workspaceDir: string, checksumFn?: StateChecksumFn) {
         const safeTaskId = rawTaskId.replace(/[^a-zA-Z0-9_\-]/g, '_');
         // 哈希输入纳入 workspaceDir：不同工作区的同名任务（"task-1"）不再互相覆盖
-        // 状态文件，"各自 HMAC 均合法的静默交叉覆盖"被根除
+        // 状态文件，"各自合法 checksum 的静默交叉覆盖"被根除
         const idHash = crypto.createHash('sha256')
             .update(String(rawTaskId) + '\n' + String(workspaceDir))
             .digest('hex').slice(0, 8);
         this.taskId = safeTaskId;
-        this.macSecret = macSecret ?? null;
+        this.checksumFn = checksumFn ?? ((body) => crypto.createHash('sha256').update(body).digest('hex'));
         this.stateDir = path.resolve(stateDir);
         this.stateFilePath = path.join(this.stateDir, `state_${safeTaskId}_${idHash}.json`);
-    }
-
-    private macOf(body: string): string {
-        if (this.macSecret !== null) {
-            return crypto.createHmac('sha256', this.macSecret).update(body).digest('hex');
-        }
-        return crypto.createHash('sha256').update(body).digest('hex');
     }
 
     private checksumOf(state: WorkflowState): string {
@@ -130,7 +130,7 @@ export class StateManager {
             rollback: rollback ?? null,
             lastError,
         });
-        return this.macOf(body);
+        return this.checksumFn(body);
     }
 
     private async persist(state: WorkflowState): Promise<void> {

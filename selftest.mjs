@@ -1108,6 +1108,43 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         eq(rejected.success, false);
         assert.match(rejected.message, /工作区无合法 DACW 标记/);
     });
+    await ta('状态校验注入点：默认 null → SHA-256 跨调用可回滚；自定义函数可透传', async () => {
+        eq(DEFAULT_ENGINE_OPTIONS.stateChecksumFn, null);
+        eq(resolveEngineOptions(null).stateChecksumFn, null);
+        const fn = (body) => 'custom:' + body.length;
+        assert.equal(resolveEngineOptions({ stateChecksumFn: fn }).stateChecksumFn, fn);   // 函数按引用透传（eq 走 JSON 语义，不能用于函数）
+        eq(resolveEngineOptions({ stateChecksumFn: 'not-a-function' }).stateChecksumFn, null);
+        // 默认（不注入）跑任务 → rollbackTask 不带函数仍能读同一状态文件
+        const prepare = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, '.dacw-workspace'),
+                JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+        };
+        const run = await runReconWorkflow('checksum-default', 'process.exit(0);', prepare);
+        assert.equal(run.result.success, true, run.result.message);
+        const res = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'workspace-restore');
+    });
+    await ta('状态校验注入：自定义 checksumFn 跨调用可读；不同函数拒绝回滚', async () => {
+        const fn = (body) => 'custom:' + body.length;
+        const prepare = async (wsDir) => {
+            await fs.writeFile(path.join(wsDir, '.dacw-workspace'),
+                JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+            await fs.writeFile(path.join(wsDir, 'seed.txt'), 'seed\n', 'utf8');
+        };
+        const run = await runReconWorkflow('checksum-custom', 'process.exit(0);', prepare, null, { stateChecksumFn: fn });
+        assert.equal(run.result.success, true, run.result.message);
+        const ok = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest', fn);
+        assert.equal(ok.success, true, ok.message);
+        // 状态文件确由自定义函数写入（checksum 形如 custom:<len>）
+        const stateName = (await fs.readdir(run.stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(run.stateDir, stateName), 'utf8'));
+        assert.match(String(persisted.checksum), /^custom:\d+$/);
+        // 换一个校验函数 → 验签失败、拒绝回滚
+        const rejected = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest', (body) => 'other:' + body.length);
+        eq(rejected.success, false);
+        assert.match(rejected.message, /状态文件校验失败/);
+    });
     await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
         const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(
             'sensitive-excluded',
