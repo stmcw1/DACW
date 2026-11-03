@@ -54,7 +54,7 @@ Prerequisites: a DSH providing `ctx.subagents`, `agentPresets` and the `spawn` p
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 116 regression vectors
+node selftest.mjs                           # 119 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -81,6 +81,7 @@ On success:
 | `workspace` / `files` / `round` | Workspace, produced files, terminating round |
 | `models` | `{ writer, reviewer }`, the models actually in effect |
 | `logs` / `elapsed_ms` | Log tail and elapsed time |
+| `task_id` / `rollback_available` | The task ID (returned even when auto-generated) and whether rollback is available |
 
 Example startup log line:
 
@@ -89,6 +90,12 @@ Example startup log line:
 ```
 
 On workflow failure the tool throws (including workspace, status, round and log tail) instead of returning a normal failure result; no path commits or merges anything.
+
+Rollback (`dacw_rollback`, human-triggered; the task terminates afterwards):
+
+- Call it with the `task_id` returned by `dacw_run`; workspace resolution is identical to `dacw_run` (same baseDir / `config.workspace` / `prepareWorkspace` — a different path cannot find the state file).
+- git workspaces: it only returns the `git reset --hard <ref>` command plus a risk note for `git clean -fd`; **DACW executes no git command**. Non-git workspaces: restored from the backup captured before the task started (the backup is kept for audit/retry).
+- A failed rollback throws (never disguised as success); the state file is verified with the same `stateChecksumFn` used to write it — **rollback must use the same plugin instance** (both default to the built-in SHA-256).
 
 ## Sandbox configuration
 

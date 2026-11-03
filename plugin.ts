@@ -23,7 +23,7 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { apply as createEngine, isValidWorkspaceMarker } from './index';
+import { apply as createEngine, isValidWorkspaceMarker, resolveEngineOptions, rollbackTask } from './index';
 import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
 import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
@@ -840,6 +840,9 @@ function renderToolResultText(value: any): string {
     lines.push(`DACW 结果：${value.success ? '机器闸门通过' : '未通过'}`);
     lines.push(`状态：${value.status}${value.status === 'NEED_HUMAN' ? '（需要人工终审，未经确认不要合入）' : ''}`);
     lines.push(`工作区：${value.workspace}`);
+    if (typeof value.task_id === 'string') {
+        lines.push(`回滚：${value.rollback_available === true ? '可用' : '不可用'}（task_id: ${value.task_id}，调用 dacw_rollback 回滚到任务开始前）`);
+    }
     if (value.models && typeof value.models.writer === 'string' && typeof value.models.reviewer === 'string') {
         lines.push(`模型：✍️ 写手 ${value.models.writer} | 🔍 审查者 ${value.models.reviewer}`);
     }
@@ -859,6 +862,29 @@ function renderToolResultText(value: any): string {
     return lines.join('\n');
 }
 
+function renderRollbackResultText(value: any): string {
+    const lines: string[] = [];
+    lines.push(`DACW 回滚：${value.success ? '成功' : '未成功'}`);
+    if (value.mode) {
+        lines.push(`模式：${value.mode === 'git-hint' ? 'git 提示（DACW 未执行 git 命令）' : '工作区备份恢复'}`);
+    }
+    if (typeof value.task_id === 'string') lines.push(`任务：${value.task_id}`);
+    if (typeof value.workspace === 'string') lines.push(`工作区：${value.workspace}`);
+    lines.push('');
+    lines.push(`说明：${String(value.message ?? '')}`);
+    if (value.record && typeof value.record.hint === 'string' && value.record.hint) {
+        lines.push('');
+        lines.push('手动回滚命令（含风险提示，请先阅读）：');
+        lines.push(value.record.hint);
+    }
+    return lines.join('\n');
+}
+
+const ROLLBACK_TOOL_DESCRIPTION =
+    '回滚 DACW 任务到任务开始前。git 工作区返回回滚指令（DACW 不执行 git 命令）；' +
+    '非 git 工作区从备份恢复。回滚需人工触发，执行后任务终止。' +
+    '必须与执行该任务的同一个 DACW 插件实例/状态配置一起使用（状态文件按 task_id + 工作区路径定位）。';
+
 const TOOL_DESCRIPTION =
     '运行 DACW（防御性智能体编程工作流）闭环：写手子代理按增量协议产出代码变更 → 确定性运行机执行项目自带测试 → ' +
     '独立审查者子代理审计全量文件并给出 JSON 裁决 → 通过后停在人工闸门（NEED_HUMAN），绝不自动合入。' +
@@ -871,12 +897,31 @@ const TOOL_DESCRIPTION =
     '因此必须指向专用空目录（工具会写入 .dacw-workspace 标记）；不要在存放重要文件的目录上运行。' +
     '模型调用发生在独立子代理会话里，不污染当前会话；子代理在创建时被剥除全部宿主工具。' +
     '写手/审查者可分别配置模型：支持 "provider/model"、纯 "model"（按 DSH 已配置模型目录自动解析 provider）或 inherit；' +
-    '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。';
+    '运行日志首行与结果 models 字段显示实际生效的写手/审查者模型。' +
+    '结果含 task_id 与 rollback_available；需要撤销本次任务时用 dacw_rollback（人工触发，回滚后任务终止）。';
 
 export function apply(ctx: any, rawConfig?: unknown) {
     const { config, warnings, sandboxExplicit } = normalizePluginConfig(rawConfig);
     const logger = makeLogger(ctx);
     for (const warning of warnings) logger.warn(`DACW: ${warning}`);
+
+    // 引擎配置在插件实例内解析一次：dacw_run（写入状态）与 dacw_rollback（读取状态）必须使用
+    // 同一个 stateChecksumFn，否则回滚验签必然失败。函数类型无法从 YAML 解析，插件路径恒为
+    // null（内置 SHA-256）；编程调用方可直接 apply() 透传自定义函数（要求同一实例内一致）。
+    const resolvedEngineOptions = resolveEngineOptions({
+        maxRounds: config.maxRounds,
+        chatTimeoutBaseMs: config.chatTimeoutBaseMs,
+        chatTimeoutPer10kCharsMs: config.chatTimeoutPer10kCharsMs,
+        chatTimeoutMaxMs: config.chatTimeoutMaxMs,
+        chatMaxAttempts: config.chatMaxAttempts,
+        writerOutputMaxChars: config.writerOutputMaxChars,
+        manifestMaxEntries: config.manifestMaxEntries,
+        stateDir: config.stateDir || null,
+        sandbox: config.sandbox,
+        sandboxExplicit,
+        allowTruncatedReview: config.allowTruncatedReview,
+        secretScanEnabled: config.secretScanEnabled,
+    });
 
     // ---- 子代理 preset 注册（persona-only；工具隔离由 agent/created 监听器完成）----
     const presets: { ready: boolean; reason: string; disposers: Array<() => Promise<void> | void> } = {
@@ -1022,8 +1067,10 @@ export function apply(ctx: any, rawConfig?: unknown) {
                     files: { type: 'array', items: { type: 'string' } },
                     logs: { type: 'array', items: { type: 'string' } },
                     elapsed_ms: { type: 'integer' },
+                    task_id: { type: 'string' },
+                    rollback_available: { type: 'boolean' },
                 },
-                required: ['success', 'status', 'message', 'workspace', 'models', 'round', 'files', 'logs', 'elapsed_ms'],
+                required: ['success', 'status', 'message', 'workspace', 'models', 'round', 'files', 'logs', 'elapsed_ms', 'task_id', 'rollback_available'],
                 additionalProperties: false,
             },
             render: (_args: unknown, value: any) => [{ type: 'text', text: renderToolResultText(value) }],
@@ -1119,19 +1166,8 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 log,
             };
             const executeTask = createEngine(engineContext, {
-                maxRounds: config.maxRounds,
-                chatTimeoutBaseMs: config.chatTimeoutBaseMs,
-                chatTimeoutPer10kCharsMs: config.chatTimeoutPer10kCharsMs,
-                chatTimeoutMaxMs: config.chatTimeoutMaxMs,
-                chatMaxAttempts: config.chatMaxAttempts,
-                writerOutputMaxChars: config.writerOutputMaxChars,
-                manifestMaxEntries: config.manifestMaxEntries,
-                stateDir: config.stateDir || null,
+                ...resolvedEngineOptions,
                 roleModels: roleModelLabels,
-                sandbox: config.sandbox,
-                sandboxExplicit,
-                allowTruncatedReview: config.allowTruncatedReview,
-                secretScanEnabled: config.secretScanEnabled,
             });
             const rawTaskId = taskIdArg || `dacw-${Date.now().toString(36)}`;
             const result = await executeTask(rawTaskId, workspaceDir, task);
@@ -1145,6 +1181,8 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 files: Array.isArray(result.files) ? result.files.map(String) : [],
                 logs: tailLogs(logs, 60, 8000),
                 elapsed_ms: Date.now() - startedAt,
+                task_id: rawTaskId,
+                rollback_available: true,
             };
             if (!value.success) {
                 const failure = new Error(
@@ -1157,8 +1195,87 @@ export function apply(ctx: any, rawConfig?: unknown) {
         },
     };
 
+    // ---- 回滚工具（人工触发；git 模式只给提示，非 git 模式从备份恢复）----
+    const rollbackToolDefinition = {
+        name: 'dacw_rollback',
+        description: ROLLBACK_TOOL_DESCRIPTION,
+        parameters: {
+            type: 'object',
+            properties: {
+                task_id: { type: 'string', description: '要回滚的任务 ID（dacw_run 返回的 task_id）。' },
+                workspace: { type: 'string', description: '可选，dacw_run 时使用的工作区；省略则用配置的 workspace，再退回当前会话工作目录。' },
+                reason: { type: 'string', description: '可选，回滚原因，记录到审计，限 500 字符。' },
+            },
+            required: ['task_id'],
+            additionalProperties: false,
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    success: { type: 'boolean' },
+                    mode: { type: ['string', 'null'] },
+                    message: { type: 'string' },
+                    task_id: { type: 'string' },
+                    workspace: { type: 'string' },
+                    record: { type: ['object', 'null'] },
+                },
+                required: ['success', 'mode', 'message', 'task_id', 'workspace', 'record'],
+                additionalProperties: false,
+            },
+            render: (_args: unknown, value: any) => [{ type: 'text', text: renderRollbackResultText(value) }],
+        },
+        async execute(rawArgs: unknown, exec: any) {
+            const args = rawArgs && typeof rawArgs === 'object' ? rawArgs as Record<string, unknown> : {};
+            const taskId = typeof args.task_id === 'string' ? args.task_id.trim() : '';
+            if (!taskId) throw new Error('[DACW] 参数 task_id 必须是非空字符串');
+            if (taskId.length > MAX_TASK_ID_CHARS) throw new Error(`[DACW] task_id 过长（${taskId.length} > ${MAX_TASK_ID_CHARS}）`);
+
+            const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+            if (reason.length > 500) throw new Error(`[DACW] reason 过长（${reason.length} > 500）`);
+
+            const workspaceArg = typeof args.workspace === 'string' ? args.workspace.trim() : '';
+            if (workspaceArg.length > MAX_WORKSPACE_ARG_CHARS) throw new Error(`[DACW] workspace 过长（${workspaceArg.length} > ${MAX_WORKSPACE_ARG_CHARS}）`);
+
+            const agent = exec && exec.agent ? exec.agent : null;
+            if (!agent) throw new Error('[DACW] 只能由 Agent 调用：执行上下文缺少调用方 Agent');
+            if (isDacwChild(agent)) throw new Error('[DACW] 禁止在 DACW 子代理内调用 dacw_rollback');
+
+            const signal: AbortSignal | undefined = exec && exec.signal ? exec.signal : undefined;
+            // 必须与 dacw_run 使用同一个 callerWorkingDirectory / prepareWorkspace / config.workspace 解析：
+            // StateManager 构造时 rawTaskId + workspaceDir 参与哈希，路径不一致就找不到状态文件。
+            const baseDir = await callerWorkingDirectory(agent, signal);
+            const requested = workspaceArg || config.workspace;
+            const workspaceDir = await prepareWorkspace(baseDir, requested, config.workspacePolicy);
+
+            const stateDir = config.stateDir || path.join(os.tmpdir(), 'dacw-state');
+            const result = await rollbackTask(
+                stateDir, taskId, workspaceDir,
+                reason || undefined,
+                resolvedEngineOptions.stateChecksumFn ?? undefined,
+            );
+            const value = {
+                success: result.success,
+                mode: result.mode,
+                message: result.message,
+                task_id: taskId,
+                workspace: workspaceDir,
+                record: result.record ?? null,
+            };
+            if (!result.success) {
+                const failure = new Error(`[DACW] 回滚未成功：${result.message}`);
+                (failure as any).dacwRollback = value;
+                throw failure;
+            }
+            logger.info(`DACW: 回滚完成（task_id=${taskId}, mode=${value.mode}, workspace=${workspaceDir}）`);
+            return value;
+        },
+    };
+
     ctx.effect(() => ctx.tools.register(toolDefinition));
+    ctx.effect(() => ctx.tools.register(rollbackToolDefinition));
     logger.info(
         `DACW: 工具 ${config.toolName} 已注册（workspacePolicy=${config.workspacePolicy}, sandbox=${config.sandbox.mode}, ` +
         `provider=${config.subagentProvider}, enforceChildToolIsolation=${config.enforceChildToolIsolation}）`);
+    logger.info('DACW: 工具 dacw_rollback 已注册（回滚到任务开始前；git 工作区仅返回命令提示）');
 }

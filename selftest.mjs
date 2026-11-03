@@ -29,8 +29,9 @@ const {
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
     parseModelSpec, matchModelInCatalogue, formatModelLabel, formatInheritLabel, DEFAULT_PLUGIN_CONFIG,
-    restrictChildTools, runSubagentChat,
+    restrictChildTools, runSubagentChat, apply: applyPlugin,
 } = plugin;
+const { StateManager } = await import('./dist/state_manager.js');
 const {
     normalizeSandboxConfig, buildDockerRunArgv, defaultImageForCommand, describePolicy, DEFAULT_SANDBOX_CONFIG,
     buildSandboxConsentRequest, parseSandboxConsentAnswer,
@@ -1144,6 +1145,139 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const rejected = await rollbackTask(run.stateDir, run.taskId, run.wsDir, 'selftest', (body) => 'other:' + body.length);
         eq(rejected.success, false);
         assert.match(rejected.message, /状态文件校验失败/);
+    });
+    // ---- 工具层（plugin.apply）：dacw_rollback 注册 + 参数校验 + workspace 解析一致性 ----
+    const makePluginHarness = (rawConfig, services = {}) => {
+        const tools = [];
+        const disposers = [];
+        const ctx = {
+            effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
+            on: () => () => {},
+            get: (name) => services[name],
+            tools: { register: (definition) => { tools.push(definition); return () => {}; } },
+        };
+        applyPlugin(ctx, rawConfig);
+        return { tools, find: (name) => tools.find((tool) => tool.name === name), disposers, services };
+    };
+    await ta('工具层：dacw_run 结果含 task_id/rollback_available；dacw_rollback git 模式端到端', async () => {
+        const baseDir = path.join(tmpRoot, 'tool-git-base');
+        const wsRaw = path.join(baseDir, 'ws');
+        await fs.mkdir(wsRaw, { recursive: true });
+        await fs.writeFile(path.join(wsRaw, '.dacw-workspace'),
+            JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+        await fs.writeFile(path.join(wsRaw, 'a.txt'), 'alpha\n', 'utf8');
+        const git = (args) => execFileAsync('git', args, { cwd: wsRaw, windowsHide: true });
+        await git(['init', '-q']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'add', '-A']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'commit', '-q', '-m', 'init']);
+        const wsDir = await fs.realpath(wsRaw);
+        const stateDir = path.join(tmpRoot, 'tool-git-state');
+        const taskId = 'tool-git-task';
+        const state = new StateManager(stateDir, taskId, wsDir);
+        await state.init('task');
+        const point = await captureRollbackPoint(wsDir, stateDir, taskId);
+        eq(point.mode, 'git');
+        await state.update((s) => { s.rollbackPoint = point; });
+        const harness = makePluginHarness({ stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => baseDir },
+        });
+        const runTool = harness.find(DEFAULT_PLUGIN_CONFIG.toolName);
+        const rollbackTool = harness.find('dacw_rollback');
+        assert.ok(runTool && rollbackTool, JSON.stringify(harness.tools.map((tool) => tool.name)));
+        // dacw_run 输出 schema 含新字段，required 覆盖
+        assert.ok(runTool.output.schema.properties.task_id);
+        assert.ok(runTool.output.schema.properties.rollback_available);
+        assert.ok(runTool.output.schema.required.includes('task_id'));
+        assert.ok(runTool.output.schema.required.includes('rollback_available'));
+        const sample = {
+            success: true, status: 'NEED_HUMAN', message: 'ok', workspace: wsDir,
+            models: { writer: 'w', reviewer: 'r' }, round: 1, files: ['a.txt'], logs: [], elapsed_ms: 1,
+            task_id: taskId, rollback_available: true,
+        };
+        const rendered = runTool.output.render([], sample)[0].text;
+        assert.match(rendered, new RegExp(`回滚：可用（task_id: ${taskId}`));
+        // 回滚工具端到端（workspace 相对 baseDir 解析，必须与建状态时一致）
+        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+        eq(value.success, true);
+        eq(value.mode, 'git-hint');
+        eq(value.task_id, taskId);
+        eq(value.workspace, wsDir);
+        eq(value.record.executed, false);
+        assert.match(value.record.hint, /git reset --hard [0-9a-f]{7,40}/);
+        assert.match(rollbackTool.output.render([], value)[0].text, /git reset --hard/);
+        // git 提示模式不改工作区
+        eq(await fs.readFile(path.join(wsDir, 'a.txt'), 'utf8'), 'alpha\n');
+    });
+    await ta('工具层：dacw_rollback workspace 模式端到端（新增文件清理、备份恢复）', async () => {
+        const baseDir = path.join(tmpRoot, 'tool-ws-base');
+        const wsRaw = path.join(baseDir, 'ws');
+        await fs.mkdir(wsRaw, { recursive: true });
+        await fs.writeFile(path.join(wsRaw, '.dacw-workspace'),
+            JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+        await fs.writeFile(path.join(wsRaw, 'seed.txt'), 'seed\n', 'utf8');
+        const wsDir = await fs.realpath(wsRaw);
+        const stateDir = path.join(tmpRoot, 'tool-ws-state');
+        const taskId = 'tool-ws-task';
+        const state = new StateManager(stateDir, taskId, wsDir);
+        await state.init('task');
+        const point = await captureRollbackPoint(wsDir, stateDir, taskId);
+        eq(point.mode, 'workspace');
+        await state.update((s) => { s.rollbackPoint = point; });
+        // 模拟任务产出的新增文件
+        await fs.writeFile(path.join(wsDir, 'unreviewed.js'), '// new\n', 'utf8');
+        const harness = makePluginHarness({ stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => baseDir },
+        });
+        const rollbackTool = harness.find('dacw_rollback');
+        const value = await rollbackTool.execute({ task_id: taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+        eq(value.success, true);
+        eq(value.mode, 'workspace-restore');
+        eq(value.record.executed, true);
+        // 新增文件被清理、备份内容恢复
+        let newFileExists = true;
+        try { await fs.access(path.join(wsDir, 'unreviewed.js')); } catch { newFileExists = false; }
+        assert.equal(newFileExists, false, '任务新增文件应被清理');
+        eq(await fs.readFile(path.join(wsDir, 'seed.txt'), 'utf8'), 'seed\n');
+        // 审计已写入状态文件
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.rollback.mode, 'workspace-restore');
+        eq(persisted.lastError, '已回滚，任务终止');
+    });
+    await ta('工具层：dacw_rollback 参数校验、找不到任务、误指无关工作区', async () => {
+        const baseDir = path.join(tmpRoot, 'tool-err-base');
+        const wsRaw = path.join(baseDir, 'ws');
+        await fs.mkdir(wsRaw, { recursive: true });
+        await fs.writeFile(path.join(wsRaw, '.dacw-workspace'),
+            JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+        const harness = makePluginHarness({}, { workingDirectory: { ensure: async () => baseDir } });
+        const rollbackTool = harness.find('dacw_rollback');
+        await assert.rejects(() => rollbackTool.execute({}, { agent: { id: 'lead-agent' } }), /task_id 必须是非空字符串/);
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: 't', reason: 'x'.repeat(501) }, { agent: { id: 'lead-agent' } }),
+            /reason 过长/);
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: 't' }, { agent: null }),
+            /只能由 Agent 调用/);
+        // 不存在的 task_id → 抛错（不伪装成功），错误对象携带 dacwRollback
+        let failure = null;
+        try {
+            await rollbackTool.execute({ task_id: 'no-such-task', workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+        } catch (error) {
+            failure = error;
+        }
+        assert.ok(failure, '应抛错');
+        assert.match(failure.message, /回滚未成功/);
+        assert.match(failure.message, /未找到任务/);
+        eq(failure.dacwRollback.success, false);
+        eq(failure.dacwRollback.task_id, 'no-such-task');
+        // 指向无关非空目录 → prepareWorkspace 拒绝（防误回滚）
+        const other = path.join(baseDir, 'other');
+        await fs.mkdir(other, { recursive: true });
+        await fs.writeFile(path.join(other, 'foreign.txt'), 'x\n', 'utf8');
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: 'x', workspace: 'other' }, { agent: { id: 'lead-agent' } }),
+            /安全拦截/);
     });
     await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
         const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(

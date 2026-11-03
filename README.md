@@ -54,7 +54,7 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 116 项回归自测
+node selftest.mjs                           # 119 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
@@ -81,6 +81,7 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 | `workspace` / `files` / `round` | 工作区、产出文件、终止轮次 |
 | `models` | `{ writer, reviewer }`，实际生效的模型 |
 | `logs` / `elapsed_ms` | 日志尾部与耗时 |
+| `task_id` / `rollback_available` | 本次任务 ID（自动生成时也返回）与回滚是否可用 |
 
 启动日志示例：
 
@@ -89,6 +90,12 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
 工作流失败时工具抛出错误（附工作区、状态、轮次与日志尾部），不会把失败伪装成普通结果；所有路径都不提交、不合入。
+
+回滚（`dacw_rollback`，人工触发，执行后任务终止）：
+
+- 用 `dacw_run` 返回的 `task_id` 调用；工作区解析与 `dacw_run` 完全一致（同一套 baseDir / `config.workspace` / `prepareWorkspace`，路径不一致会找不到状态文件）。
+- git 工作区：只返回 `git reset --hard <ref>` 命令与 `git clean -fd` 的风险提示，**DACW 不执行任何 git 命令**；非 git 工作区：从任务开始前的备份恢复（备份保留供审计/重试）。
+- 回滚失败会抛错（不伪装成功）；状态文件校验使用与写入时一致的 `stateChecksumFn`——**必须在同一个插件实例内回滚**（默认均为内置 SHA-256）。
 
 ## 沙箱配置
 
