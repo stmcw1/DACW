@@ -58,7 +58,7 @@ if (!Array.isArray(secrets.SECRET_PATTERNS) || secrets.SECRET_PATTERNS.length !=
   throw new Error('build: dist/secrets.js must export 5 SECRET_PATTERNS');
 }
 
-for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict', 'enumerateWorkspace', 'fingerprintProtectedDirs', 'diffDigest', 'isSensitiveReviewFile', 'scanWriterOutputForSecrets']) {
+for (const name of ['apply', 'parseWriterDelta', 'mergeDelta', 'parseReviewVerdict', 'enumerateWorkspace', 'fingerprintProtectedDirs', 'diffDigest', 'isSensitiveReviewFile', 'scanWriterOutputForSecrets', 'captureRollbackPoint']) {
   if (typeof engine[name] !== 'function') throw new Error(`build: dist/index.js does not export ${name}()`);
 }
 for (const name of ['apply', 'normalizePluginConfig', 'extractTextBlocks', 'buildActivationSpec', 'restrictChildTools', 'runSubagentChat']) {

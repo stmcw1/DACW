@@ -8,6 +8,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const engine = await import('./dist/index.js');
 const plugin = await import('./dist/plugin.js');
@@ -20,6 +24,7 @@ const { redactSecretsInText } = secretsModule;
 const {
     parseWriterDelta, parseReviewVerdict, mergeDelta, resolveEngineOptions, DEFAULT_ENGINE_OPTIONS,
     enumerateWorkspace, diffDigest, fingerprintProtectedDirs, isSensitiveReviewFile, scanWriterOutputForSecrets,
+    captureRollbackPoint,
 } = engine;
 const {
     normalizePluginConfig, extractTextBlocks, buildActivationSpec, isValidWorkspaceMarker, prepareWorkspace,
@@ -724,6 +729,57 @@ try {
             process.env.PATH = prevPath;
         }
     });
+    await ta('回滚点：workspace 模式备份整目录（排除 .git/node_modules/.dacw-workspace）', async () => {
+        const exists = async (p) => { try { await fs.access(p); return true; } catch { return false; } };
+        const wsDir = path.join(tmpRoot, 'rollback-ws');
+        await fs.mkdir(path.join(wsDir, 'node_modules'), { recursive: true });
+        await fs.mkdir(path.join(wsDir, 'sub', '.git'), { recursive: true });
+        await fs.writeFile(path.join(wsDir, 'a.txt'), 'alpha\n', 'utf8');
+        await fs.writeFile(path.join(wsDir, 'b.txt'), 'beta\n', 'utf8');
+        await fs.writeFile(path.join(wsDir, 'node_modules', 'dep.js'), 'dep\n', 'utf8');
+        await fs.writeFile(path.join(wsDir, 'sub', '.git', 'config'), 'x\n', 'utf8');
+        await fs.writeFile(path.join(wsDir, '.dacw-workspace'), '{"managedBy":"@stmcw1/dacw"}\n', 'utf8');
+        const stateDir = path.join(tmpRoot, 'rollback-state');
+        const point = await captureRollbackPoint(wsDir, stateDir, 'task-workspace-1');
+        eq(point.mode, 'workspace');
+        assert.match(point.ref, /^[0-9a-f]{8}$/);
+        assert.ok(!Number.isNaN(Date.parse(point.capturedAt)), point.capturedAt);
+        const backupDir = path.join(stateDir, 'backup', point.ref);
+        assert.equal(await exists(backupDir), true, '备份目录应存在');
+        eq(await fs.readFile(path.join(backupDir, 'a.txt'), 'utf8'), 'alpha\n');
+        eq(await fs.readFile(path.join(backupDir, 'b.txt'), 'utf8'), 'beta\n');
+        assert.equal(await exists(path.join(backupDir, 'node_modules')), false, 'node_modules 不应备份');
+        assert.equal(await exists(path.join(backupDir, 'sub', '.git')), false, '.git 不应备份');
+        assert.equal(await exists(path.join(backupDir, '.dacw-workspace')), false, '.dacw-workspace 不应备份');
+        // 边界 1：stateDir 位于工作区内 → 拒绝
+        await assert.rejects(
+            () => captureRollbackPoint(wsDir, path.join(wsDir, 'state'), 'task-workspace-1'),
+            /stateDir 不能位于工作区内/);
+        // 边界 3：同 taskId 重跑 → 旧备份作废（残留文件不保留）
+        await fs.writeFile(path.join(backupDir, 'stale.txt'), 'stale\n', 'utf8');
+        const point2 = await captureRollbackPoint(wsDir, stateDir, 'task-workspace-1');
+        eq(point2.ref, point.ref);
+        assert.equal(await exists(path.join(backupDir, 'stale.txt')), false, '旧备份应作废');
+    });
+    await ta('回滚点：git 模式记录 HEAD commit（不备份工作区）', async () => {
+        const wsDir = path.join(tmpRoot, 'rollback-git');
+        await fs.mkdir(wsDir, { recursive: true });
+        await fs.writeFile(path.join(wsDir, 'a.txt'), 'git-alpha\n', 'utf8');
+        const git = (args) => execFileAsync('git', args, { cwd: wsDir, windowsHide: true });
+        await git(['init', '-q']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'add', '-A']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'commit', '-q', '-m', 'init']);
+        const { stdout } = await git(['rev-parse', 'HEAD']);
+        const stateDir = path.join(tmpRoot, 'rollback-state-git');
+        const point = await captureRollbackPoint(wsDir, stateDir, 'task-git-1');
+        eq(point.mode, 'git');
+        eq(point.ref, stdout.trim());
+        // git 模式不产生 workspace 备份目录
+        const backupRoot = path.join(stateDir, 'backup');
+        let backupExists = true;
+        try { await fs.access(backupRoot); } catch { backupExists = false; }
+        assert.equal(backupExists, false, 'git 模式不应创建备份目录');
+    });
 
     // ---- 测试后对账（不变量 6）：假 npm 模拟「测试期改写工作区」 ----
     const makeFakeNpm = async (name, scriptBody) => {
@@ -845,8 +901,11 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         const prepare = async (wsDir) => {
             await fs.mkdir(path.join(wsDir, 'node_modules', 'dep'), { recursive: true });
             await fs.writeFile(path.join(wsDir, 'node_modules', 'dep', 'index.js'), 'dep', 'utf8');
-            await fs.mkdir(path.join(wsDir, '.git'), { recursive: true });
-            await fs.writeFile(path.join(wsDir, '.git', 'HEAD'), 'ref', 'utf8');
+            // 回滚点捕获要求 .git 是可用仓库（读不到 HEAD 时 fail-closed）；用真实 git 仓库做夹具。
+            const git = (args) => execFileAsync('git', args, { cwd: wsDir, windowsHide: true });
+            await git(['init', '-q']);
+            await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'add', '-A']);
+            await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'commit', '-q', '-m', 'init']);
         };
         const { result, reviewerCalled, reviewerInput } = await runReconWorkflow('f2-clean', 'process.exit(0);', prepare);
         assert.equal(reviewerCalled, true);

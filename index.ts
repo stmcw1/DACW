@@ -23,11 +23,16 @@ import * as os from 'os';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { Runner } from './runner';
 import { StateManager } from './state_manager';
+import type { RollbackPoint } from './state_manager';
 import { DEFAULT_SANDBOX_CONFIG, buildSandboxConsentRequest, describePolicy, detectDocker, normalizeSandboxConfig, resolveExecutionPolicy } from './sandbox';
 import type { ExecutionPolicy, SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 import { scanWriterOutputForSecrets } from './secrets';
+
+const execFileAsync = promisify(execFile);
 
 // B 组的纯函数由 secrets.ts 提供（与 C 组运行机脱敏共用同一套模式），此处保留导出以兼容既有调用方。
 export { scanWriterOutputForSecrets };
@@ -688,9 +693,69 @@ function buildWriterPrompt(taskPrompt: string, baseFiles: Map<string, string>, f
     return feedback ? `${taskPrompt}\n\n${rule}\n\n${base}\n\n${feedback}` : `${taskPrompt}\n\n${rule}\n\n${base}`;
 }
 
+/**
+ * 任务开始前捕获回滚点：
+ *   - 根级 .git 存在 → 记录 HEAD commit（git 模式，回滚时只给提示，DACW 不执行 git 命令）；
+ *   - 否则 → 整目录备份到 stateDir/backup/<hash>/（workspace 模式，回滚时由 DACW 恢复）。
+ * 备份排除 .git / node_modules / .dacw-workspace。
+ */
+export async function captureRollbackPoint(
+    workspaceDir: string,
+    stateDir: string,
+    rawTaskId: string,
+): Promise<RollbackPoint> {
+    const resolvedWorkspace = path.resolve(workspaceDir);
+    const resolvedStateDir = path.resolve(stateDir);
+    // 状态目录不能位于工作区内，否则备份会递归包含自身
+    if (resolvedStateDir === resolvedWorkspace
+        || resolvedStateDir.startsWith(resolvedWorkspace + path.sep)) {
+        throw new Error(`[安全拦截] stateDir 不能位于工作区内：${resolvedStateDir}`);
+    }
+    // 工作区可能尚未创建（引擎/插件在准入阶段会创建）：先确保目录存在，备份空目录也是合法回滚点。
+    await fs.mkdir(resolvedWorkspace, { recursive: true });
+    const capturedAt = new Date().toISOString();
+    const gitDir = path.join(resolvedWorkspace, '.git');
+
+    if (fsSync.existsSync(gitDir)) {
+        try {
+            const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+                cwd: resolvedWorkspace,
+                timeout: 5000,
+                windowsHide: true,
+            });
+            const ref = stdout.trim();
+            if (!ref) throw new Error('git rev-parse HEAD 返回空');
+            return { mode: 'git', ref, capturedAt };
+        } catch (e: any) {
+            // fail-closed：语义不能混——用户以为是 git 回滚，实际却是 DACW 恢复整目录。
+            throw new Error(`检测到 .git 但无法读取 HEAD（仓库可能损坏）：${e?.message ?? String(e)}`);
+        }
+    }
+
+    // workspace 模式：整目录备份
+    const backupKey = crypto.createHash('sha256')
+        .update(String(rawTaskId) + '\n' + resolvedWorkspace)
+        .digest('hex').slice(0, 8);
+    const backupDir = path.join(resolvedStateDir, 'backup', backupKey);
+    await fs.rm(backupDir, { recursive: true, force: true });   // 同 taskId 重跑：旧备份作废
+    await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+    try {
+        await fs.cp(resolvedWorkspace, backupDir, {
+            recursive: true,
+            filter: (src: string) => {
+                const base = path.basename(src);
+                return base !== '.git' && base !== 'node_modules' && base !== '.dacw-workspace';
+            },
+        });
+    } catch (e: any) {
+        await fs.rm(backupDir, { recursive: true, force: true }).catch(() => { });
+        throw new Error(`工作区备份失败：${e?.message ?? String(e)}`);
+    }
+    return { mode: 'workspace', ref: backupKey, capturedAt };
+}
+
 /** 按“送入模型的总字符数”计算自适应聊天超时（写手按基线、审查者按送审 payload）。 */
-function chatTimeoutForChars(totalChars: number, options: EngineOptions): number {
-    const extra = Math.floor(totalChars / 10_000) * options.chatTimeoutPer10kCharsMs;
+function chatTimeoutForChars(totalChars: number, options: EngineOptions): number {    const extra = Math.floor(totalChars / 10_000) * options.chatTimeoutPer10kCharsMs;
     return Math.min(options.chatTimeoutBaseMs + extra, options.chatTimeoutMaxMs);
 }
 
@@ -775,6 +840,23 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             logError(context, '[警告] 你显式配置了 sandbox.mode="host"：测试将以宿主用户全权限直接执行（无隔离），'
                 + '写手产出的任意代码——包括 package.json 的 test/pretest 等脚本——都将在你的账号下运行。'
                 + '子代理工具隔离与审查者审计均不构成对测试进程的约束。');
+        }
+
+        // 任务开始前捕获回滚点：git 模式记录 HEAD（回滚只提示，不执行 git 命令）；否则整目录备份。
+        // 捕获失败 → fail-closed：本次任务不启动（绝不带着“没有回滚点”的现实继续写代码）。
+        try {
+            const rollbackPoint = await captureRollbackPoint(workspaceDir, STATE_DIR, rawTaskId);
+            await stateManager.update((s) => { s.rollbackPoint = rollbackPoint; });
+            logSystem(context, `🔄 回滚点已记录：${rollbackPoint.mode === 'git'
+                ? `git ${rollbackPoint.ref}`
+                : `workspace 备份 ${rollbackPoint.ref}`}`);
+        } catch (e: any) {
+            await stateManager.update((s) => {
+                s.status = 'NEED_HUMAN';
+                s.lastError = `回滚点捕获失败：${e.message}`;
+            });
+            logError(context, `回滚点捕获失败，本次任务不启动：${e.message}`);
+            return finish(false, `无法记录回滚点（${e.message}），本次任务不启动`, 0);
         }
 
         for (let round = 1; round <= options.maxRounds; round++) {
