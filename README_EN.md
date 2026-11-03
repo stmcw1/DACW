@@ -58,7 +58,7 @@ Build requires Node ≥ 22.13; tests run on the host by default (no isolation, r
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 120 regression vectors
+node selftest.mjs                           # 125 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 

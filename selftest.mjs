@@ -1154,10 +1154,35 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             startActivation: async () => ({ childId: 'selftest-child', dispose: async () => {} }),
         },
     });
-    const makePluginHarness = (rawConfig, services = {}) => {
+    const makePluginHarness = (rawConfig, services = {}, opts = {}) => {
         const tools = [];
         const disposers = [];
         const mergedServices = { ...makeDefaultHostServices(), ...services };
+        // userQuestions 四态（B6）：confirm（默认）/ cancel / missing / error；
+        // 若调用方通过 services 显式提供自定义 userQuestions（如交互请求形态 spy），则保持不动。
+        const userQuestionsMode = opts.userQuestions;
+        if (userQuestionsMode !== undefined) {
+            if (userQuestionsMode === 'missing') delete mergedServices.userQuestions;
+            else if (userQuestionsMode === 'confirm') {
+                mergedServices.userQuestions = {
+                    ask: async ({ questions }) => ({ answers: [{ id: questions[0].id, selected: ['确认回滚'] }] }),
+                };
+            } else if (userQuestionsMode === 'cancel') {
+                mergedServices.userQuestions = {
+                    ask: async ({ questions }) => ({ answers: [{ id: questions[0].id, selected: ['取消'] }] }),
+                };
+            } else if (userQuestionsMode === 'error') {
+                mergedServices.userQuestions = {
+                    ask: async () => { throw new Error('userQuestions boom'); },
+                };
+            } else {
+                throw new Error(`unknown userQuestions mode: ${userQuestionsMode}`);
+            }
+        } else if (!mergedServices.userQuestions) {
+            mergedServices.userQuestions = {
+                ask: async ({ questions }) => ({ answers: [{ id: questions[0].id, selected: ['确认回滚'] }] }),
+            };
+        }
         const ctx = {
             effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
             on: () => () => {},
@@ -1169,6 +1194,28 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         };
         applyPlugin(ctx, rawConfig);
         return { tools, find: (name) => tools.find((tool) => tool.name === name), disposers, services: mergedServices };
+    };
+    // B6：构造可回滚夹具（非 git 工作区 + 已捕获回滚点 + 一个"任务新增文件"），并读取状态文件。
+    const makeRollbackFixture = async (tag) => {
+        const baseDir = path.join(tmpRoot, `b6-${tag}`);
+        const wsRaw = path.join(baseDir, 'ws');
+        await fs.mkdir(wsRaw, { recursive: true });
+        await fs.writeFile(path.join(wsRaw, '.dacw-workspace'),
+            JSON.stringify({ managedBy: '@stmcw1/dacw' }) + '\n', 'utf8');
+        await fs.writeFile(path.join(wsRaw, 'seed.txt'), 'seed\n', 'utf8');
+        const wsDir = await fs.realpath(wsRaw);
+        const stateDir = path.join(tmpRoot, `b6-${tag}-state`);
+        const taskId = `b6-${tag}-task`;
+        const state = new StateManager(stateDir, taskId, wsDir);
+        await state.init('task');
+        const point = await captureRollbackPoint(wsDir, stateDir, taskId);
+        await state.update((s) => { s.rollbackPoint = point; });
+        await fs.writeFile(path.join(wsDir, 'unreviewed.js'), '// new\n', 'utf8');
+        const readState = async () => {
+            const name = (await fs.readdir(stateDir)).find((entry) => entry.startsWith('state_'));
+            return JSON.parse(await fs.readFile(path.join(stateDir, name), 'utf8'));
+        };
+        return { baseDir, wsDir, stateDir, taskId, readState };
     };
     await ta('宿主兼容性探测：结构性缺失 fail-fast；provider 未注册仅告警；tools.restrict 条件必需', async () => {
         const makeCtx = (tools, services, warnLogs = []) => ({
@@ -1337,6 +1384,113 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         await assert.rejects(
             () => rollbackTool.execute({ task_id: 'x', workspace: 'other' }, { agent: { id: 'lead-agent' } }),
             /安全拦截/);
+    });
+    await ta('B6-1 回滚确认：ask 返回无 answers/无 selected → fail-closed，工作区不变、rollback 未写入', async () => {
+        const fixture = await makeRollbackFixture('confirm-missing');
+        const digestBefore = await enumerateWorkspace(fixture.wsDir);
+        const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => fixture.baseDir },
+            userQuestions: { ask: async () => ({}) },   // 结构缺失：无 answers
+        });
+        const rollbackTool = harness.find('dacw_rollback');
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+            /用户未确认回滚/);
+        const digestAfter = await enumerateWorkspace(fixture.wsDir);
+        eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
+        const persisted = await fixture.readState();
+        eq(persisted.rollback, null);
+        assert.ok(persisted.rollbackPoint, 'rollbackPoint 应仍在');
+    });
+    await ta('B6-2 回滚确认：用户选择取消 → fail-closed，工作区不变、rollback 未写入', async () => {
+        const fixture = await makeRollbackFixture('cancel');
+        const digestBefore = await enumerateWorkspace(fixture.wsDir);
+        const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => fixture.baseDir },
+        }, { userQuestions: 'cancel' });
+        const rollbackTool = harness.find('dacw_rollback');
+        await assert.rejects(
+            () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+            /用户未确认回滚/);
+        const digestAfter = await enumerateWorkspace(fixture.wsDir);
+        eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
+        eq((await fixture.readState()).rollback, null);
+    });
+    await ta('B6-3 回滚确认：无交互且未设置 token → fail-closed，工作区不变、rollback 未写入', async () => {
+        const fixture = await makeRollbackFixture('no-token');
+        const prevToken = process.env.DACW_ROLLBACK_TOKEN;
+        try {
+            delete process.env.DACW_ROLLBACK_TOKEN;
+            const digestBefore = await enumerateWorkspace(fixture.wsDir);
+            const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+                workingDirectory: { ensure: async () => fixture.baseDir },
+            }, { userQuestions: 'missing' });
+            const rollbackTool = harness.find('dacw_rollback');
+            await assert.rejects(
+                () => rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } }),
+                /未设置 DACW_ROLLBACK_TOKEN/);
+            const digestAfter = await enumerateWorkspace(fixture.wsDir);
+            eq(Object.fromEntries(digestAfter), Object.fromEntries(digestBefore));
+            eq((await fixture.readState()).rollback, null);
+        } finally {
+            if (prevToken === undefined) delete process.env.DACW_ROLLBACK_TOKEN;
+            else process.env.DACW_ROLLBACK_TOKEN = prevToken;
+        }
+    });
+    await ta('B6-4 回滚确认：交互请求形态（id/header/options/agent/signal/关键信息）', async () => {
+        const fixture = await makeRollbackFixture('shape');
+        let captured = null;
+        const ask = async (request) => {
+            captured = request;
+            return { answers: [{ id: request.questions[0].id, selected: ['确认回滚'] }] };
+        };
+        const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+            workingDirectory: { ensure: async () => fixture.baseDir },
+            userQuestions: { ask },
+        });
+        const rollbackTool = harness.find('dacw_rollback');
+        const agent = { id: 'lead-agent' };
+        const controller = new AbortController();
+        const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent, signal: controller.signal });
+        eq(value.success, true);
+        eq(value.mode, 'workspace-restore');
+        assert.ok(captured, '应捕获交互请求');
+        assert.equal(captured.agent, agent);
+        assert.equal(captured.signal, controller.signal);
+        eq(captured.questions.length, 1);
+        const question = captured.questions[0];
+        eq(question.id, 'dacw-rollback-confirm');
+        eq(question.header, '确认回滚');
+        eq(question.options.map((option) => option.label), ['确认回滚', '取消']);
+        assert.ok(question.question.includes(fixture.taskId), question.question);
+        assert.ok(question.question.includes(fixture.wsDir), question.question);
+        assert.match(question.question, /回滚点/);
+        // 确认后确实执行了回滚：任务新增文件被清理
+        const after = await enumerateWorkspace(fixture.wsDir);
+        assert.ok(!Array.from(after.keys()).includes('unreviewed.js'), JSON.stringify(Array.from(after.keys())));
+    });
+    await ta('B6-5 回滚确认：无交互但显式设置 DACW_ROLLBACK_TOKEN → 允许回滚（headless）', async () => {
+        const fixture = await makeRollbackFixture('token');
+        const prevToken = process.env.DACW_ROLLBACK_TOKEN;
+        try {
+            process.env.DACW_ROLLBACK_TOKEN = 'selftest-token';
+            const harness = makePluginHarness({ stateDir: fixture.stateDir, workspace: '' }, {
+                workingDirectory: { ensure: async () => fixture.baseDir },
+            }, { userQuestions: 'missing' });
+            const rollbackTool = harness.find('dacw_rollback');
+            const value = await rollbackTool.execute({ task_id: fixture.taskId, workspace: 'ws' }, { agent: { id: 'lead-agent' } });
+            eq(value.success, true);
+            eq(value.mode, 'workspace-restore');
+            eq(value.record.executed, true);
+            const after = await enumerateWorkspace(fixture.wsDir);
+            assert.ok(!Array.from(after.keys()).includes('unreviewed.js'), JSON.stringify(Array.from(after.keys())));
+            const persisted = await fixture.readState();
+            eq(persisted.rollback.mode, 'workspace-restore');
+            eq(persisted.lastError, '已回滚，任务终止');
+        } finally {
+            if (prevToken === undefined) delete process.env.DACW_ROLLBACK_TOKEN;
+            else process.env.DACW_ROLLBACK_TOKEN = prevToken;
+        }
     });
     await ta('敏感文件：不送模型审查、仍在交付清单、message 标注排除（F3 通过）', async () => {
         const { result, reviewerCalled, reviewerInput, logs } = await runReconWorkflow(
