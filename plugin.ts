@@ -572,7 +572,7 @@ interface IsolationState {
  * 失败时【抛错】：agent/created 是 serial 监听器，抛错会让本次子代理创建失败（不发布），
  * 避免"已发布但还带着继承工具"的时间窗。
  *
- * fail-closed（E 组）：只有「restrict 成功应用」+「tools.schemas(agent) 返回空数组」两个条件
+ * fail-closed：只有「restrict 成功应用」+「tools.schemas(agent) 返回空数组」两个条件
  * 同时满足才记为成功；验证能力缺失（缺 tools.schemas / 返回非数组 / 调用抛错）一律 fail，
  * 绝不"无法验证但记成功"。enforceChildToolIsolation=false 是唯一逃生门（见 apply()）。
  */
@@ -683,7 +683,7 @@ export async function runSubagentChat(options: {
     };
 
     // fail-closed：要求隔离生效的子代理，在启动后必须确认工具已被剥离。
-    // E 组验收：enforce=true 时任何「无法确认隔离」的路径都必须终止——
+    // enforce=true 时任何「无法确认隔离」的路径都必须终止——
     //   preset 不可用（无法确认运行在零工具 preset 上）、provider 未返回 childId、隔离未生效。
     // 唯一逃生门是显式 enforceChildToolIsolation=false（allowInheritedPresets 不再单独构成旁路）。
     if (config.enforceChildToolIsolation) {
@@ -896,7 +896,7 @@ const ROLLBACK_CONFIRM_ACCEPT_LABEL = '确认回滚';
 const ROLLBACK_CONFIRM_CANCEL_LABEL = '取消';
 
 /**
- * 回滚交互确认（B2）：向宿主 userQuestions 发起结构化确认，仅当用户明确选择
+ * 回滚交互确认：向宿主 userQuestions 发起结构化确认，仅当用户明确选择
  * 「确认回滚」才返回 true；取消 / 无答案 / 结构非法 → false（由调用方 fail-closed）。
  * 交互异常：abort 类异常按取消处理（abortError），其余包装为明确错误向上抛。
  */
@@ -983,21 +983,25 @@ function assertHostCompatibility(ctx: any, config: PluginConfig, logger: { warn:
     const getService = (name: string): any => {
         try { return ctx && typeof ctx.get === 'function' ? ctx.get(name) : undefined; } catch { return undefined; }
     };
+    // agentPresets 与 subagents 是「异步挂载」的服务：cordis 服务在 init 完成后才出现在 ctx 上，
+    // 且不同 bundle 层的挂载顺序不同。激活瞬间不可用 ≠ 宿主不支持：
+    //   - agentPresets：apply() 走 ctx.inject 等待服务；始终不出现时由 dacw_run 的 fail-closed 拒绝。
+    //   - subagents：dacw_run 调用时会再次检查（缺服务 / 缺 getProvider / 缺 startActivation 都 fail-closed）。
     const agentPresets = getService('agentPresets');
     if (!agentPresets || typeof agentPresets.register !== 'function') {
-        throw hostIncompatible("ctx.get('agentPresets').register");
+        logger.warn(
+            "DACW: 激活时 ctx.get('agentPresets') 尚不可用；将等待该服务挂载后再注册 preset。"
+            + '若始终不可用，enforceChildToolIsolation=true 时 dacw_run 会 fail-closed 拒绝。',
+        );
     }
     const subagents = getService('subagents');
-    if (!subagents || typeof subagents.getProvider !== 'function') {
-        throw hostIncompatible("ctx.get('subagents').getProvider");
-    }
-    if (typeof subagents.startActivation !== 'function') {
-        throw hostIncompatible("ctx.get('subagents').startActivation");
+    if (!subagents || typeof subagents.getProvider !== 'function' || typeof subagents.startActivation !== 'function') {
+        logger.warn("DACW: 激活时 ctx.get('subagents') 尚不可用（getProvider/startActivation）；将在 dacw_run 调用时再次检查并拒绝。");
     }
     // provider 注册缺失不拒绝激活（可能是加载顺序问题）：warn 并留待 dacw_run 时再次检查。
     const providerName = String(config.subagentProvider || 'spawn');
     let provider: any;
-    try { provider = subagents.getProvider(providerName); } catch { provider = undefined; }
+    try { provider = subagents && typeof subagents.getProvider === 'function' ? subagents.getProvider(providerName) : undefined; } catch { provider = undefined; }
     if (!provider || typeof provider !== 'object') {
         logger.warn(`DACW: provider "${providerName}" 在激活时尚未注册（可能是加载顺序问题）；将在 dacw_run 调用时再次检查。`);
     }
@@ -1031,12 +1035,17 @@ export function apply(ctx: any, rawConfig?: unknown) {
     // ---- 子代理 preset 注册（persona-only；工具隔离由 agent/created 监听器完成）----
     const presets: { ready: boolean; reason: string; disposers: Array<() => Promise<void> | void> } = {
         ready: false,
-        reason: '尚未注册',
+        reason: '尚未注册（等待 agentPresets 服务）',
         disposers: [],
     };
-    const agentPresets: any = (() => { try { return ctx.get('agentPresets'); } catch { return undefined; } })();
-    if (agentPresets && typeof agentPresets.register === 'function') {
-        ctx.effect(() => {
+    // 供 composedPresetOf / 隔离监听器复用；ctx.inject 晚到时也会更新。
+    let agentPresetsService: any = (() => { try { return ctx.get('agentPresets'); } catch { return undefined; } })();
+
+    const registerPresets = (service: any, ownerCtx: any) => {
+        agentPresetsService = service;
+        // effect 必须挂在「拿到该服务的 ctx」上：经由 ctx.inject 得到的 child 才与 agentPresets
+        // 处于同一作用域，否则 dispose 时机与外层 ctx 错配。
+        ownerCtx.effect(() => {
             let disposed = false;
             void (async () => {
                 try {
@@ -1045,14 +1054,14 @@ export function apply(ctx: any, rawConfig?: unknown) {
                         presetDefinition(REVIEWER_PRESET_ID, 'DACW Reviewer', 'DACW 审查者子代理：只输出 JSON 裁决，创建时剥除全部宿主工具。', 92, REVIEWER_PERSONA),
                     ];
                     for (const definition of definitions) {
-                        const dispose = await agentPresets.register(definition);
+                        const dispose = await service.register(definition);
                         if (disposed) {
                             try { await dispose(); } catch { /* 已丢弃 */ }
                             continue;
                         }
                         if (typeof dispose === 'function') presets.disposers.push(dispose);
-                        if (typeof agentPresets.resolve === 'function') {
-                            const detail = await agentPresets.resolve(definition.id).catch(() => null);
+                        if (typeof service.resolve === 'function') {
+                            const detail = await service.resolve(definition.id).catch(() => null);
                             if (detail && typeof detail.broken === 'string' && detail.broken) {
                                 throw new Error(`${definition.id} 激活失败：${detail.broken}`);
                             }
@@ -1074,8 +1083,26 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 }
             };
         });
+    };
+
+    if (agentPresetsService && typeof agentPresetsService.register === 'function') {
+        // 最常见路径：服务已就绪，同步注册。
+        registerPresets(agentPresetsService, ctx);
+    } else if (typeof ctx.inject === 'function') {
+        // 服务晚到：交给 cordis 等待依赖就绪，再在 child 作用域里注册。
+        presets.reason = '等待 agentPresets 服务出现（尚未注册）';
+        ctx.inject(['agentPresets'], (child: any) => {
+            const service = (() => { try { return child.get('agentPresets'); } catch { return undefined; } })();
+            if (service && typeof service.register === 'function') {
+                registerPresets(service, child);
+            } else {
+                presets.ready = false;
+                presets.reason = 'ctx.inject 已触发但 agentPresets 不可用（宿主未注册该服务）';
+                logger.warn(`DACW: ${presets.reason}`);
+            }
+        });
     } else {
-        presets.reason = '宿主未提供 agentPresets 服务';
+        presets.reason = '宿主未提供 agentPresets 服务，且 Context 不支持 inject';
         logger.warn('DACW: 宿主未提供 agentPresets 服务，无法注册写手/审查者 preset');
     }
 
@@ -1090,8 +1117,8 @@ export function apply(ctx: any, rawConfig?: unknown) {
     };
     const composedPresetOf = (agent: any): string | undefined => {
         try {
-            if (agentPresets && typeof agentPresets.composedPreset === 'function' && agent && agent.ctx) {
-                return agentPresets.composedPreset(agent.ctx);
+            if (agentPresetsService && typeof agentPresetsService.composedPreset === 'function' && agent && agent.ctx) {
+                return agentPresetsService.composedPreset(agent.ctx);
             }
         } catch { /* 视为未知 */ }
         return undefined;
@@ -1197,6 +1224,9 @@ export function apply(ctx: any, rawConfig?: unknown) {
             if (!provider) {
                 const available = typeof subagents.list === 'function' ? subagents.list().join(', ') : '未知';
                 throw new Error(`[DACW] 子代理 provider "${providerName}" 未注册（可用：${available}）`);
+            }
+            if (typeof subagents.startActivation !== 'function') {
+                throw new Error('[DACW] 宿主 subagents 服务缺少 startActivation：无法创建写手/审查者子代理，拒绝运行。请确认 DSH 版本（0.2.1-rc.5 起应提供该入口）。');
             }
             if (presets.ready && provider.capabilities && provider.capabilities.agentPreset === false) {
                 throw new Error(
@@ -1323,11 +1353,11 @@ export function apply(ctx: any, rawConfig?: unknown) {
                 type: 'object',
                 properties: {
                     success: { type: 'boolean' },
-                    mode: { type: ['string', 'null'] },
+                    mode: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                     message: { type: 'string' },
                     task_id: { type: 'string' },
                     workspace: { type: 'string' },
-                    record: { type: ['object', 'null'] },
+                    record: { oneOf: [{ type: 'object' }, { type: 'null' }] },
                 },
                 required: ['success', 'mode', 'message', 'task_id', 'workspace', 'record'],
                 additionalProperties: false,

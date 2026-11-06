@@ -55,7 +55,6 @@ export function isValidWorkspaceMarker(content: unknown): boolean {
     }
 }
 
-// B 组的纯函数由 secrets.ts 提供（与 C 组运行机脱敏共用同一套模式），此处保留导出以兼容既有调用方。
 export { scanWriterOutputForSecrets };
 
 /**
@@ -101,7 +100,7 @@ export interface EngineOptions {
     /** 用户是否显式配置了 sandbox.mode="host"（用于日志分级：显式 → 红色警告；默认值 → 普通提示）。 */
     sandboxExplicit: boolean;
     /**
-     * G3 逃生门（默认关）：允许"审查不完整"（输入被截断 / 锁文件仅送摘要）时仍放行 success:true。
+     * 逃生门（默认关）：允许"审查不完整"（输入被截断 / 锁文件仅送摘要）时仍放行 success:true。
      * 打开即降低安全保证：只有显式配置才生效，且 message/日志/files 会持续标注。
      */
     allowTruncatedReview: boolean;
@@ -175,7 +174,7 @@ const LOCK_REVIEW_DIGEST_SET = new Set(LOCK_REVIEW_DIGEST_FILES);
 
 /**
  * 敏感文件默认不送模型审查（内容不进入审查输入）；文件仍正常交付、仍在 `files` 清单中。
- * 排除项记入 `reviewExcluded`，供 F3 断言（iteratedKeys ∪ reviewExcluded === postDigest）与 message 标注。
+ * 排除项记入 `reviewExcluded`，（iteratedKeys ∪ reviewExcluded === postDigest）与 message 标注。
  * 这是内容外发边界：秘密/AKey 不发给模型提供方，由人工在合入前审阅这些文件。
  */
 const SENSITIVE_REVIEW_PATTERNS = [
@@ -325,7 +324,7 @@ async function safeChat(context: DSHContext, agentId: string, prompt: string, co
                 logError(context, `[取消] ${agentId} 调用被取消，工作流终止。`);
                 return { ok: false, reason: lastReason, aborted: true };
             }
-            // [修复] 超时绝不立即并发重试：会话中仍挂着未完成的请求，立即重试会造成
+            // 超时绝不立即并发重试：会话中仍挂着未完成的请求，立即重试会造成
             // 并发与上下文错乱。按结构化标记判断（不再依赖错误文案字符串匹配）。
             if (e?.isChatTimeout === true) {
                 logError(context, `[警告] ${agentId} 响应超时，为了防止并发导致上下文错乱，放弃本次重试。`);
@@ -381,7 +380,7 @@ async function resolveInsideWorkspaceReal(workspaceDir: string, relPath: string)
     return { root, target };
 }
 
-// [漏洞3修复] 彻底使用真实路径 (realpath) 并进行 lstat 校验，防符号链接越权
+// 彻底使用真实路径 (realpath) 并进行 lstat 校验，防符号链接越权
 async function safeWriteFile(workspaceDir: string, relativeFilePath: string, content: string) {
     // 1. 词法校验（防 `../`）+ 高危目录拦截
     if (touchesRiskyDir(relativeFilePath)) {
@@ -446,7 +445,7 @@ async function safeCleanWorkspace(workspaceDir: string) {
 
 // ================= 测试后对账（安全不变量 6：审查对象 === 最终交付物） =================
 /**
- * F1：忽略集只在【根目录】生效（相对路径无分隔符）。子目录里的同名条目
+ * 忽略集只在【根目录】生效（相对路径无分隔符）。子目录里的同名条目
  * （如 nested/node_modules/...、sub/.git/...）不忽略，正常纳入对账与审查——
  * 否则测试可以在嵌套 node_modules 里投放文件而完全绕过对账。
  * `.dacw-workspace` 是 DACW 自己的根级标记文件，根层级忽略即可，无内容风险。
@@ -461,8 +460,8 @@ const PROTECTED_ROOT_DIRS = ['.git', 'node_modules'];
 /**
  * 递归枚举工作区，返回「相对路径（统一用 / 分隔）→ 文件内容 SHA256」。
  * 安全语义：遇到符号链接或非普通文件项直接抛错（fail-closed）——对账对象必须可
- * 完整、确定地枚举；忽略仅在根级成立（F1），根级 .git / node_modules 交由
- * fingerprintProtectedDirs 做指纹对账（F2），不递归其内容。
+ * 完整、确定地枚举；忽略仅在根级成立，根级 .git / node_modules 交由
+ * fingerprintProtectedDirs 做指纹对账，不递归其内容。
  */
 export async function enumerateWorkspace(root: string): Promise<Map<string, string>> {
     const resolvedRoot = path.resolve(root);
@@ -497,7 +496,7 @@ export async function enumerateWorkspace(root: string): Promise<Map<string, stri
 }
 
 /**
- * F2：根级受保护目录（.git / node_modules）指纹 =「存在性 + 顶层条目列表 + 摘要」。
+ * 根级受保护目录（.git / node_modules）指纹 =「存在性 + 顶层条目列表 + 摘要」。
  * 只读顶层 dirent，不递归内容、不跟随符号链接；目录不存在则不记录（缺失/新建由
  * diffDigest 的 - / + 表达）。测试期增删顶层条目（或创建/删除整个目录）都会改变
  * 指纹 → 对账转人工。
@@ -799,7 +798,7 @@ export interface RollbackExecutionInfo {
 export type RollbackBeforeExecute = (info: RollbackExecutionInfo) => Promise<void>;
 
 /**
- * 执行一次任务回滚（步骤 3）：
+ * 执行一次任务回滚：
  *   - 先验证工作区 `.dacw-workspace` 标记合法，再按 (stateDir, rawTaskId, workspaceDir) 载入状态；
  *   - git 模式只返回命令提示（DACW 不执行任何 git 命令，绝不自动 reset/clean）；
  *   - workspace 模式从任务开始前的备份恢复（`safeCleanWorkspace` 语义 + 捕获时同款过滤规则；
@@ -861,7 +860,7 @@ export async function rollbackTask(
     const beforeFiles = Array.from(beforeDigest.keys());
     const at = new Date().toISOString();
 
-    // 4.5 可选执行前回调（人工确认/二次授权）：位置在 beforeFiles 之后、模式分支之前。
+    // 可选执行前回调（人工确认/二次授权）：位置在 beforeFiles 之后、模式分支之前。
     // 回调抛错直接向上冒泡——不写 rollback 审计、不改工作区、不返回 success。
     if (typeof onBeforeExecute === 'function') {
         await onBeforeExecute({
@@ -876,7 +875,7 @@ export async function rollbackTask(
     let message: string;
 
     if (rollbackPoint.mode === 'git') {
-        // 5a. git 模式：只给提示，不执行任何 git 命令。
+        // git 模式：只给提示，不执行任何 git 命令。
         const hint = [
             `git reset --hard ${rollbackPoint.ref}`,
             '',
@@ -925,7 +924,7 @@ export async function rollbackTask(
             + `备份目录保留供审计/重试：${backupDir}`;
     }
 
-    // 6. 写审计：回滚后任务必须终止（工作区内容 ≠ baseFiles）。
+    // 写审计：回滚后任务必须终止（工作区内容 ≠ baseFiles）。
     try {
         await stateManager.update((s) => {
             s.rollback = record;
@@ -1057,7 +1056,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             finalFiles = null;
             conversation.checkpoint();
 
-            // 1. 写手阶段
+            // 写手阶段
             logProgress(context, round, options.maxRounds, startTime, '写手思考中...');
             const writerOutcome = await safeChat(
                 context, 'writer-agent',
@@ -1073,7 +1072,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 continue;
             }
 
-            // 2. 解析 + 合并 + 落盘
+            // 解析 + 合并 + 落盘
             let delta: WriterDelta;
             try {
                 delta = parseWriterDelta(writerOutcome.text, options.writerOutputMaxChars);
@@ -1131,9 +1130,9 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 throw new Error(`工作区落盘崩溃，一致性已破坏：${e.message}`);
             }
 
-            // 3. 测试前快照（不变量 6 的基准）：测试不得改变工作区任何已有内容。
-            //    baseDigest 来自写手基线（内存），preDigest 是测试前工作区快照（基线 ∪ 地基文件，
-            //    如 package.json）——以快照为期望状态，否则地基文件会被 diff 误判为"新增"。
+            // 测试前快照（不变量 6 的基准）：测试不得改变工作区任何已有内容。
+            // baseDigest 来自写手基线（内存），preDigest 是测试前工作区快照（基线 ∪ 地基文件，
+            // 如 package.json）——以快照为期望状态，否则地基文件会被 diff 误判为"新增"。
             const baseDigest = new Map<string, string>();
             for (const [rel, content] of baseFiles) {
                 baseDigest.set(rel.split(path.sep).join('/'), crypto.createHash('sha256').update(content, 'utf8').digest('hex'));
@@ -1160,7 +1159,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, `写入后的工作区与基线不一致（${baselineMismatch.length} 个文件），需人工介入：${detail}`, round);
             }
 
-            // 4. 运行机阶段
+            // 运行机阶段
             logProgress(context, round, options.maxRounds, startTime, '运行机测试中...');
             const sniffed = sniffTestCommand(workspaceDir);
             const testRun = await runner.run(sniffed.command, sniffed.args);
@@ -1174,7 +1173,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             }
             logSuccess(context, '测试通过！');
 
-            // 5. 测试后对账（不变量 6）：测试可能改写工作区，审查对象必须 === 最终交付物。
+            // 测试后对账（不变量 6）：测试可能改写工作区，审查对象必须 === 最终交付物。
             logProgress(context, round, options.maxRounds, startTime, '测试后对账中...');
             let postDigest: Map<string, string>;
             let postProtected: Map<string, string>;
@@ -1194,7 +1193,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 logError(context, message);
                 return finish(false, message, round);
             }
-            // F2：根级 .git / node_modules 的「存在性 + 顶层条目列表」指纹对账（不递归内容）。
+            // 根级 .git / node_modules 的「存在性 + 顶层条目列表」指纹对账（不递归内容）。
             const protectedDiff = diffDigest(preProtected, postProtected);
             if (protectedDiff.length > 0) {
                 const message = `测试后对账不通过：根级受保护目录（.git / node_modules）在测试期被改动`
@@ -1206,14 +1205,14 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             finalFiles = Array.from(postDigest.keys());
             logSuccess(context, `测试后对账通过：${postDigest.size} 个交付文件与基线一致`);
 
-            // 6. 审查阶段
+            // 审查阶段
             logProgress(context, round, options.maxRounds, startTime, '审查员代码审计中...');
             let actualCodes = '';
             let readFailed = false;
             let readErrorMsg = '';
             let reviewTruncated = false;   // 审查输入被字符上限截断（单文件 / 总输入）
             let reviewPartial = false;     // G2：锁文件只送 SHA256 摘要——不构成语义审查
-            /** F3：记录审查循环实际遍历到的键集（与 postDigest / finalFiles 做三边界一致性断言）。 */
+            /** 记录审查循环实际遍历到的键集（与 postDigest / finalFiles 做三边界一致性断言）。 */
             const iteratedKeys: string[] = [];
             /** 敏感文件默认不送模型审查：记录被排除的键（文件仍交付，finalFiles 保留完整清单）。 */
             const reviewExcluded = new Set<string>();
@@ -1246,7 +1245,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 }
                 return appendReviewChunk(`\n\n--- 文件: ${label} ---\n${capped}`);
             };
-            /** G1：截断/摘要送审的完整说明——未送审文件、单文件截断位置、总输入上限。 */
+            /** 截断/摘要送审的完整说明——未送审文件、单文件截断位置、总输入上限。 */
             const describeReviewIncompleteness = (): string => {
                 const lines: string[] = [];
                 lines.push(`审查不完整：reviewTruncated=${reviewTruncated}，reviewPartial=${reviewPartial}。`);
@@ -1286,7 +1285,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                     try {
                         const code = await safeReadForReview(workspaceDir, rel);
                         if (!appendReviewFile(relDisplay, code)) {
-                            // G1：总输入上限截断——记录当前文件与其余未送审文件（fail-closed 明细）。
+                            // 总输入上限截断——记录当前文件与其余未送审文件（fail-closed 明细）。
                             truncatedFiles.push(`${relDisplay}（受总输入上限 ${options.reviewInputMaxChars} 字符限制，未能完整送审）`);
                             const remainingKeys = reviewKeys.slice(i + 1).map((key) => key.split(path.sep).join('/'));
                             // 敏感文件不会因截断改变"不送审"的原因（敏感排除）；补记到 reviewExcluded，
@@ -1322,7 +1321,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                             break;
                         }
                     }
-                    // [N-2] 锁文件只送 SHA256 摘要；G2：摘要送审不构成语义审查，标记 reviewPartial 并记录明细。
+                    // 锁文件只送 SHA256 摘要；G2：摘要送审不构成语义审查，标记 reviewPartial 并记录明细。
                     for (const f of LOCK_REVIEW_DIGEST_FILES) {
                         if (!fsSync.existsSync(path.join(path.resolve(workspaceDir), f))) continue;
                         try {
@@ -1398,7 +1397,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, '审查结果存在可疑信号（PASS 但含 REJECTED/BYPASS 字样），需人工确认', round);
             }
 
-            // G1/G2/G3：截断 / 摘要送审的 fail-closed 闸门——默认配置下任何"审查不完整"都禁止 PASS。
+            // 截断 / 摘要送审的 fail-closed 闸门——默认配置下任何"审查不完整"都禁止 PASS。
             const reviewIncomplete = reviewTruncated || reviewPartial;
             const escapedIncomplete = reviewIncomplete && options.allowTruncatedReview === true;
             if (reviewIncomplete && !escapedIncomplete) {
@@ -1411,7 +1410,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, message, round);
             }
 
-            // F3：最终三边界一致性断言——`iteratedKeys ∪ reviewExcluded === postDigest.keys()`、
+            // 最终三边界一致性断言——`iteratedKeys ∪ reviewExcluded === postDigest.keys()`、
             // finalFiles 保留完整清单（敏感文件确实交付，只是不送审）；
             // 且审查结束再枚举必须与 postDigest（及受保护目录指纹）一致（防审查期间被变动）。
             // 任一不等一律 success:false 转人工，绝不放行 success:true。
@@ -1430,7 +1429,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
             const boundaryProblems: string[] = [];
             const sameKeySet = (keys: string[], expected: Map<string, string>): boolean =>
                 keys.length === expected.size && keys.every((key) => expected.has(key));
-            // F3：审查覆盖 = 实际遍历键集 ∪ 敏感排除集，必须完整覆盖对账清单。
+            // 审查覆盖 = 实际遍历键集 ∪ 敏感排除集，必须完整覆盖对账清单。
             const reviewedOrExcluded = new Set<string>([...iteratedKeys, ...reviewExcluded]);
             if (!escapedIncomplete && reviewedOrExcluded.size !== postDigest.size) {
                 const missing = Array.from(postDigest.keys()).filter((key) => !reviewedOrExcluded.has(key));
@@ -1457,7 +1456,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
                 return finish(false, message, round);
             }
 
-            // G3 逃生门（显式开启时才存在）：放行不完整审查，但 message/日志/files 必须持续标注。
+            // 逃生门（显式开启时才存在）：放行不完整审查，但 message/日志/files 必须持续标注。
             if (escapedIncomplete && finalFiles !== null) {
                 const annotate = new Map<string, string>();
                 for (const label of truncatedFiles) {
@@ -1477,7 +1476,7 @@ async function runWorkflow(context: DSHContext, rawTaskId: string, workspaceDir:
 
             await stateManager.update((s) => { s.status = 'NEED_HUMAN'; });
             logSuccess(context, '全链路通过！进入人工闸门审核。');
-            // D 组：交付清单行数汇总（写进 finish message）；随后在清单条目上标注敏感文件
+            // 交付清单行数汇总（写进 finish message）；随后在清单条目上标注敏感文件
             //（敏感文件仍交付，只是未送模型审查——用后缀与"截断/未送审"区分）。
             const deliveredFiles = finalFiles ?? Array.from(baseFiles.keys());
             const totalLines = deliveredFiles.reduce((sum, rel) => {
