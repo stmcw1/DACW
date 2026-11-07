@@ -55,7 +55,7 @@
 | 文件 | `steps/secret_scan.ts`、`sandbox_check.ts`、`generate.ts`、`merge.ts`、`pre_test_snapshot.ts`、`test.ts`、`reconcile.ts`、`review.ts`、`human_gate.ts` |
 | 做法 | 每个 Step 包住 `apply()` 里对应一段逻辑；`apply()` 改为依次调用 Step，**行为逐字节不变** |
 | 约束 | Step 只通过 `ctx` 拿输入，`output` 返回产出；不读模块级闭包变量 |
-| 验收 | 现有 128 项 selftest 全绿；每个 Step 至少一条独立单测 |
+| 验收 | 现有 131 项 selftest 全绿；每个 Step 至少一条独立单测 |
 | 风险 | `apply()` 里有共享局部变量 → 必须显式搬进 `PipelineState`，否则 Step 间隐式耦合 |
 
 **为什么先抽 Step 再换主干：** 一步到位改主干 + 抽 Step，出问题无法定位是 Step 错还是路由错。
