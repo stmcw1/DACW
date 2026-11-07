@@ -1187,6 +1187,19 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
             effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
             on: () => () => {},
             get: (name) => mergedServices[name],
+            // 模拟 cordis 4.x 的 ctx.inject(deps, callback)：依赖就绪后以 child ctx 回调。
+            // opts.lateServices 用来模拟「激活时还没有、稍后才挂载」的服务。
+            inject: (deps, callback) => {
+                const childServices = { ...mergedServices, ...(opts.lateServices || {}) };
+                const child = {
+                    get: (name) => childServices[name],
+                    effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
+                    on: () => () => {},
+                    inject: () => ({ dispose: () => {} }),
+                };
+                callback(child);
+                return { dispose: () => {} };
+            },
             tools: {
                 register: (definition) => { tools.push(definition); return () => {}; },
                 restrict: () => () => {},
@@ -1242,19 +1255,20 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.doesNotThrow(() => applyPlugin(
             makeCtx({ register: () => () => {} }, makeDefaultHostServices()),
             { enforceChildToolIsolation: false, allowInheritedPresets: true }));
-        // 4) 缺少 agentPresets.register
-        assertMissing(makeCtx(goodTools, {
-            subagents: makeDefaultHostServices().subagents,
-        }), {}, /宿主不兼容：缺少 ctx\.get\('agentPresets'\)\.register/);
-        // 5) 缺少 subagents.getProvider
-        assertMissing(makeCtx(goodTools, {
-            agentPresets: makeDefaultHostServices().agentPresets,
-        }), {}, /宿主不兼容：缺少 ctx\.get\('subagents'\)\.getProvider/);
-        // 6) 缺少 subagents.startActivation（DSH 实际激活入口）
-        assertMissing(makeCtx(goodTools, {
-            agentPresets: makeDefaultHostServices().agentPresets,
-            subagents: { getProvider: () => ({ name: 'spawn' }) },
-        }), {}, /宿主不兼容：缺少 ctx\.get\('subagents'\)\.startActivation/);
+        // 4) 缺少 agentPresets.register → 不再拒绝激活（服务可能晚到）；降级为等待，并给出明确告警。
+        const warn4 = [];
+        assert.doesNotThrow(() => applyPlugin(
+            makeCtx(goodTools, { subagents: makeDefaultHostServices().subagents }, warn4), {}));
+        assert.ok(warn4.some((line) => line.includes('agentPresets')), JSON.stringify(warn4));
+        // 5) 缺少 subagents.getProvider → 不再拒绝激活；由 dacw_run 运行时 fail-closed（见下方工具层用例）。
+        assert.doesNotThrow(() => applyPlugin(
+            makeCtx(goodTools, { agentPresets: makeDefaultHostServices().agentPresets }), {}));
+        // 6) 缺少 subagents.startActivation → 不再拒绝激活；由 dacw_run 运行时 fail-closed。
+        assert.doesNotThrow(() => applyPlugin(
+            makeCtx(goodTools, {
+                agentPresets: makeDefaultHostServices().agentPresets,
+                subagents: { getProvider: () => ({ name: 'spawn' }) },
+            }), {}));
         // 7) provider 未注册（getProvider 返回 undefined）→ 不拒绝激活，仅 warn（留待 dacw_run 再检查）
         const warnLogs = [];
         assert.doesNotThrow(() => applyPlugin(makeCtx(goodTools, {
@@ -1264,6 +1278,38 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         assert.ok(
             warnLogs.some((line) => line.includes('provider "spawn"') && line.includes('将在 dacw_run 调用时再次检查')),
             JSON.stringify(warnLogs));
+    });
+    await ta('运行时闸门：subagents 缺 getProvider / startActivation 时 dacw_run fail-closed', async () => {
+        const missingProvider = makePluginHarness({ workspace: '' }, { subagents: {} });
+        await assert.rejects(
+            () => missingProvider.find('dacw_run').execute({ task: 'x' }, { agent: { id: 'a1', ctx: {} } }),
+            /子代理 provider "spawn" 未注册/);
+        const missingActivation = makePluginHarness({ workspace: '' }, {
+            subagents: { getProvider: (name) => ({ name, capabilities: { agentPreset: true } }) },
+        });
+        await assert.rejects(
+            () => missingActivation.find('dacw_run').execute({ task: 'x' }, { agent: { id: 'a1', ctx: {} } }),
+            /缺少 startActivation/);
+    });
+    await ta('运行时闸门：enforceChildToolIsolation=true 且缺 agentPresets → fail-closed 并给出出路', async () => {
+        const harness = makePluginHarness({ workspace: '' }, { agentPresets: undefined });
+        await assert.rejects(
+            () => harness.find('dacw_run').execute({ task: 'x' }, { agent: { id: 'a1', ctx: {} } }),
+            (error) => {
+                assert.match(error.message, /preset 不可用/);
+                assert.match(error.message, /enforceChildToolIsolation: false/);
+                return true;
+            });
+    });
+    await ta('preset 延迟注册：ctx.inject 拿到晚到的 agentPresets 后注册 writer/reviewer', async () => {
+        const registered = [];
+        const spy = {
+            register: async (definition) => { registered.push(definition.id); return () => {}; },
+            resolve: async () => ({}),
+        };
+        makePluginHarness({}, { agentPresets: undefined }, { lateServices: { agentPresets: spy } });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.deepEqual(registered.slice().sort(), ['dacw-reviewer', 'dacw-writer']);
     });
     await ta('工具层：dacw_run 结果含 task_id/rollback_available；dacw_rollback git 模式端到端', async () => {
         const baseDir = path.join(tmpRoot, 'tool-git-base');

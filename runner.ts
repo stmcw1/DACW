@@ -356,7 +356,7 @@ export class Runner {
                 if (timedOut) {
                     finalOutput += `\n[执行超时 ${timeoutMs}ms，运行机已强杀进程树；exitCode=${exitCode ?? 'null'}, signal=${exitSignal ?? 'none'}]`;
                 }
-                // C 组：finalOutput 落定前对完整文本一次性脱敏（5 类凭据 → [REDACTED:<类别>]）。
+                // finalOutput 落定前对完整文本一次性脱敏（5 类凭据 → [REDACTED:<类别>]）。
                 // 下游（stateManager.testResult / feedback / 日志 / 结果 message）只接触脱敏文本。
                 finalOutput = redactSecretsInText(finalOutput);
                 resolve({
