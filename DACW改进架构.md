@@ -72,7 +72,7 @@
 | 回边 | 若保留「REJECTED → 重写」，迁移表写 `maxRounds`，超限转 `NEED_HUMAN` |
 | 终态 | `NEED_HUMAN` / `ABORTED` 无出边，任何 Step 调用被拒 |
 | 删除 | `engine.apply()` 原长函数 |
-| 验收 | 主干 ≤ 50 行；128 项 selftest 全绿；新增非法迁移用例 |
+| 验收 | 主干 ≤ 50 行；131 项 selftest 全绿；新增非法迁移用例 |
 
 **这是唯一一次「改主干」的提交，独立 PR，便于回滚。**
 
