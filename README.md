@@ -94,6 +94,24 @@ npm pack --pack-destination ../dacw-pack    # 生成安装产物
 
 工作流失败时工具抛出错误（附工作区、状态、轮次与日志尾部），不会把失败伪装成普通结果；所有路径都不提交、不合入。
 
+### 在已有项目中使用
+
+不要把项目根目录作为 workspace。默认情况下，工作区安全闸门要求工作区是空目录（或带本插件写入的合法 `.dacw-workspace` 标记），项目根目录会被拒绝。
+
+推荐姿势：在项目下新建空子目录作为 workspace，例如：
+
+```
+your-project/
+├── .dacw-work/        ← workspace，加入 .gitignore
+├── src/
+└── package.json
+```
+
+DACW 每轮只重置 `.dacw-work/` 内的非地基文件，项目其他文件不受影响。注意两点：
+
+1. **依赖与工具链**：子目录内没有外层项目的 `node_modules`/依赖。测试命令需指向外层工具链，或预先在子目录内安装。纯 Python/Go 等项目同理。
+2. **不要手写伪造 `.dacw-workspace` 标记来绕过空目录检查**。该标记由插件写入，用于标识「本目录允许重置」。手写伪造等于主动让重置逻辑接管该目录——比显式设置 `workspacePolicy: "allow"` 更隐蔽，因为闸门看起来放行了，但重置会直接动手。
+
 ### 回滚（dacw_rollback）
 
 回滚是高影响操作：调用时**必须传 `confirm: true`**（boolean 字面量；缺省或非 `true` 直接拒绝，且不触碰工作区），工具随后请求人类交互确认（DSH `userQuestions`）；

@@ -94,6 +94,24 @@ Example startup log line:
 
 On workflow failure the tool throws (including workspace, status, round and log tail) instead of returning a normal failure result; no path commits or merges anything.
 
+### Using with an existing project
+
+Do not use the project root as the workspace. By default, the workspace safety gate requires the workspace to be an empty directory (or one carrying a valid `.dacw-workspace` marker written by this plugin); the project root will be rejected.
+
+Recommended setup: create an empty subdirectory under the project as the workspace, e.g.:
+
+```
+your-project/
+├── .dacw-work/        ← workspace, add to .gitignore
+├── src/
+└── package.json
+```
+
+DACW only resets non-foundation files inside `.dacw-work/` each round; the rest of the project is untouched. Two caveats:
+
+1. **Dependencies and toolchain**: the subdirectory does not inherit the outer project's `node_modules`/dependencies. Point the test command at the outer toolchain, or install dependencies inside the subdirectory beforehand. Same for pure Python/Go projects.
+2. **Do not hand-craft a `.dacw-workspace` marker to bypass the empty-directory check.** The marker is written by the plugin to signal "this directory may be reset." Hand-crafting it means you are voluntarily handing the directory to the reset logic — more deceptive than setting `workspacePolicy: "allow"`, because the gate appears to pass while reset acts directly.
+
 ### Rollback (dacw_rollback)
 
 Rollback is a high-impact operation: calls **must pass `confirm: true`** (a boolean literal; omitted or any non-`true` value is rejected before touching the filesystem), and the tool then requests an interactive human confirmation (DSH `userQuestions`); when the host has no interaction capability, set `DACW_ROLLBACK_TOKEN=<any non-empty string>` in the DSH host environment — otherwise execution is refused.
