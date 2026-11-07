@@ -57,7 +57,7 @@ Build requires Node ≥ 22.13; tests run on the host by default (no isolation, r
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 128 regression vectors
+node selftest.mjs                           # 131 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
@@ -207,7 +207,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 
 ## Status
 
-Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and 128 regression vectors pass. The default execution policy is host (no isolation); `auto`/`docker` are explicit opt-ins (fail-closed / interactive confirmation when Docker is unavailable — see "Sandbox configuration"). **Live host-execution loop status:** v1.0.2 completed the closed-loop verification on the DSH `desktop` profile (writer produced files → `npm test` passed → independent reviewer PASS → `NEED_HUMAN`, child tool isolation measured in effect); v1.1.0 changed the default execution policy, rollback authorization, secret controls, post-test reconciliation and host capability probe, and the loop **has not been re-run on v1.1.0 yet** — the v1.0.2 conclusion does not carry over; this section will be updated once re-verification passes. Issues and PRs are welcome.
+Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and 131 regression vectors pass. The default execution policy is host (no isolation); `auto`/`docker` are explicit opt-ins (fail-closed / interactive confirmation when Docker is unavailable — see "Sandbox configuration"). **Live host-execution loop status:** v1.1.0 changed the default execution policy, rollback authorization, secret controls, post-test reconciliation and host capability probe, and **has completed the closed-loop verification on the DSH `0.2.2-rc.1` desktop host** (2026-11-06): plugin activation, `dacw_run` writer output → test → independent review → `NEED_HUMAN`, `dacw_rollback` workspace restore, secret-scan hit rejection, and `userQuestions` human confirmation — all five paths measured in effect. Known limitations: see ROADMAP "4b. Known limitations / Prioritized suggestions". Issues and PRs are welcome.
 
 ## License
 
