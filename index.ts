@@ -209,6 +209,31 @@ function isFoundationName(name: string): boolean {
     return CLEAN_PROTECTED_PATTERNS.some(p => p.test(name));
 }
 
+/**
+ * 列出工作区**根级**地基文件（不递归）：
+ *   - 根级 readdir（不进入子目录）；
+ *   - 显式排除 .git / node_modules / .dacw-workspace；
+ *   - 其余条目按 isFoundationName 判定（复用同一份地基清单，不新造判定逻辑）；
+ *   - 只返回普通文件（不返回目录/符号链接），返回文件名（非绝对路径）；无命中返回 []。
+ *
+ * 1.1.1 用途：captureRollbackPoint 在任务开始时记录该快照，rollbackTask 据此清理
+ * 「任务期间新增、任务开始时不存在的根级地基文件」，修复回滚后地基文件残留。
+ * 结果排序，保证同一工作区快照稳定（便于审计与断言）。
+ */
+export async function listRootFoundationFiles(workspaceDir: string): Promise<string[]> {
+    const resolved = path.resolve(workspaceDir);
+    const entries = await fs.readdir(resolved, { withFileTypes: true });
+    const names: string[] = [];
+    for (const entry of entries) {
+        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.dacw-workspace') continue;
+        if (!entry.isFile()) continue;
+        if (!isFoundationName(entry.name)) continue;
+        names.push(entry.name);
+    }
+    names.sort();
+    return names;
+}
+
 /** 词法越权校验（不触 fs）：mergeDelta 与写手路径校验共用，防 `../` 逃逸 */
 function resolveInsideWorkspace(workspaceDir: string, relPath: string): string {
     const safeDir = path.resolve(workspaceDir);
@@ -756,6 +781,10 @@ export async function captureRollbackPoint(
         }
     }
 
+    // 1.1.1：记录任务开始时根级地基文件快照（空工作区显式 []，与「键缺失」区分）。
+    // 回滚时据此清理任务期间新增的地基文件；快照读取失败 → 抛错（回滚点捕获失败 → 任务不启动）。
+    const foundationAtStart = await listRootFoundationFiles(resolvedWorkspace);
+
     // workspace 模式：整目录备份
     const backupKey = crypto.createHash('sha256')
         .update(String(rawTaskId) + '\n' + resolvedWorkspace)
@@ -775,7 +804,7 @@ export async function captureRollbackPoint(
         await fs.rm(backupDir, { recursive: true, force: true }).catch(() => { });
         throw new Error(`工作区备份失败：${e?.message ?? String(e)}`);
     }
-    return { mode: 'workspace', ref: backupKey, capturedAt };
+    return { mode: 'workspace', ref: backupKey, capturedAt, foundationAtStart };
 }
 
 /** 回滚执行结果。 */
@@ -802,7 +831,8 @@ export type RollbackBeforeExecute = (info: RollbackExecutionInfo) => Promise<voi
  *   - 先验证工作区 `.dacw-workspace` 标记合法，再按 (stateDir, rawTaskId, workspaceDir) 载入状态；
  *   - git 模式只返回命令提示（DACW 不执行任何 git 命令，绝不自动 reset/clean）；
  *   - workspace 模式从任务开始前的备份恢复（`safeCleanWorkspace` 语义 + 捕获时同款过滤规则；
- *     备份保留供审计/重试，不删除）；
+ *     备份保留供审计/重试，不删除）；恢复前按 `foundationAtStart` 三态清理任务期间新增的
+ *     根级地基文件（undefined=跳过；[]=清理全部；列表=只清理不在列表中的）；
  *   - 全部失败路径 fail-closed（success:false + 明确 message），回滚后任务必须终止
  *     （工作区内容 ≠ baseFiles，不变量 1 已破坏），审计写入 status=NEED_HUMAN、lastError=已回滚。
  *   - 可选 `onBeforeExecute`：在真正执行 git-hint/workspace-restore 之前调用，供调用方做人工确认；
@@ -897,6 +927,17 @@ export async function rollbackTask(
         }
         try {
             await safeCleanWorkspace(resolvedWorkspace);
+            // 1.1.1 地基文件三态清理（仅根级、不递归；判定用 Array.isArray + 长度，不靠键缺失 vs undefined）：
+            //   - undefined（1.1.0 旧 state；git 模式不会进入本分支）→ 跳过，保持 1.1.0 行为；
+            //   - []：任务开始时无地基文件 → 清理所有根级地基文件；
+            //   - 非空数组：清理不在快照中的根级地基文件（快照内的保留，内容由备份恢复）。
+            if (Array.isArray(rollbackPoint.foundationAtStart)) {
+                const keptFoundation = new Set(rollbackPoint.foundationAtStart);
+                for (const name of await listRootFoundationFiles(resolvedWorkspace)) {
+                    if (keptFoundation.has(name)) continue;
+                    await fs.unlink(path.join(resolvedWorkspace, name));
+                }
+            }
             await fs.cp(backupDir, resolvedWorkspace, {
                 recursive: true,
                 filter: (src: string) => {

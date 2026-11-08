@@ -28,7 +28,7 @@ import type { RollbackExecutionInfo } from './index';
 import { DEFAULT_SANDBOX_CONFIG, normalizeSandboxConfig, parseSandboxConsentAnswer } from './sandbox';
 import type { SandboxConfig, SandboxConsentRequest, SandboxConsentResult } from './sandbox';
 
-const PLUGIN_VERSION = '1.1.0';
+const PLUGIN_VERSION = '1.1.1';
 const WRITER_PRESET_ID = 'dacw-writer';
 const REVIEWER_PRESET_ID = 'dacw-reviewer';
 const WORKSPACE_MARKER = '.dacw-workspace';

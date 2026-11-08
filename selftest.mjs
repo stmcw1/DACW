@@ -1109,6 +1109,139 @@ fs.writeFileSync('node_modules/injected.js', '// injected by test');
         eq(rejected.success, false);
         assert.match(rejected.message, /工作区无合法 DACW 标记/);
     });
+
+    // ---- v10 §0.1（1.1.1）：回滚地基文件残留修复（四场景，各一条独立断言） ----
+    // 临时目录显式放在仓库同级 tmp/ 下（本机 = E:\DSH_workspace\tmp），每次运行唯一子目录；
+    // 不建 test-fixtures/。历史运行目录不主动清理（测试内不做删除）。
+    const rollbackTmpBase = path.resolve(import.meta.dirname, '..', 'tmp');
+    await fs.mkdir(rollbackTmpBase, { recursive: true });
+    const rollbackTmpRoot = await fs.mkdtemp(path.join(rollbackTmpBase, 'dacw-1.1.1-'));
+    const pathExists = async (p) => { try { await fs.access(p); return true; } catch { return false; } };
+    const writeWorkspaceMarker = async (wsDir) => fs.writeFile(
+        path.join(wsDir, '.dacw-workspace'),
+        JSON.stringify({ managedBy: '@stmcw1/dacw', version: '1.1.0' }) + '\n',
+        'utf8');
+    const captureAndInitState = async (wsDir, stateDir, taskId) => {
+        const point = await captureRollbackPoint(wsDir, stateDir, taskId);
+        const stateManager = new StateManager(stateDir, taskId, wsDir);
+        await stateManager.init('selftest rollback foundation（1.1.1）');
+        await stateManager.update((state) => { state.rollbackPoint = point; });
+        return point;
+    };
+
+    await ta('1.1.1 场景1：空工作区 → foundationAtStart === []，回滚清理写手新增的 package.json', async () => {
+        const base = path.join(rollbackTmpRoot, 'case1-empty');
+        const wsDir = path.join(base, 'workspace');
+        const stateDir = path.join(base, 'state');
+        await fs.mkdir(wsDir, { recursive: true });
+        await writeWorkspaceMarker(wsDir);
+        const taskId = 'selftest-foundation-empty';
+        const point = await captureAndInitState(wsDir, stateDir, taskId);
+        eq(point.mode, 'workspace');
+        eq(point.foundationAtStart, [], '空工作区必须记录显式 []（不是 undefined）');
+        // 写手在任务期间新增地基文件
+        await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'writer-added' }), 'utf8');
+        const res = await rollbackTask(stateDir, taskId, wsDir, 'selftest 1.1.1');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'workspace-restore');
+        assert.equal(await pathExists(path.join(wsDir, 'package.json')), false,
+            '任务开始时不存在的地基文件应在回滚时被清理');
+        const stateName = (await fs.readdir(stateDir)).find((name) => name.startsWith('state_'));
+        const persisted = JSON.parse(await fs.readFile(path.join(stateDir, stateName), 'utf8'));
+        eq(persisted.rollbackPoint.foundationAtStart, []);
+    });
+    await ta('1.1.1 场景2：已有 package.json → foundationAtStart === ["package.json"]，回滚保留并恢复内容', async () => {
+        const base = path.join(rollbackTmpRoot, 'case2-foundation');
+        const wsDir = path.join(base, 'workspace');
+        const stateDir = path.join(base, 'state');
+        await fs.mkdir(wsDir, { recursive: true });
+        await writeWorkspaceMarker(wsDir);
+        const originalPackage = JSON.stringify({ name: 'original', version: '1.0.0' });
+        await fs.writeFile(path.join(wsDir, 'package.json'), originalPackage, 'utf8');
+        const taskId = 'selftest-foundation-present';
+        const point = await captureAndInitState(wsDir, stateDir, taskId);
+        eq(point.foundationAtStart, ['package.json']);
+        // 写手改写地基文件内容
+        await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'writer-modified' }), 'utf8');
+        const res = await rollbackTask(stateDir, taskId, wsDir, 'selftest 1.1.1');
+        assert.equal(res.success, true, res.message);
+        assert.equal(await pathExists(path.join(wsDir, 'package.json')), true,
+            '任务开始已存在的地基文件必须保留');
+        eq(await fs.readFile(path.join(wsDir, 'package.json'), 'utf8'), originalPackage);
+    });
+    await ta('1.1.1 场景3：git 模式 → foundationAtStart === undefined，回滚跳过地基清理', async () => {
+        const base = path.join(rollbackTmpRoot, 'case3-git');
+        const wsDir = path.join(base, 'workspace');
+        const stateDir = path.join(base, 'state');
+        await fs.mkdir(wsDir, { recursive: true });
+        await writeWorkspaceMarker(wsDir);
+        await fs.writeFile(path.join(wsDir, 'seed.txt'), 'seed\n', 'utf8');
+        const git = (args) => execFileAsync('git', args, { cwd: wsDir, windowsHide: true });
+        await git(['init', '-q']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'add', '-A']);
+        await git(['-c', 'user.name=selftest', '-c', 'user.email=selftest@example.com', 'commit', '-q', '-m', 'init']);
+        const taskId = 'selftest-foundation-git';
+        const point = await captureAndInitState(wsDir, stateDir, taskId);
+        eq(point.mode, 'git');
+        assert.equal(point.foundationAtStart, undefined, 'git 模式不写 foundationAtStart 键');
+        // 任务期间新增地基文件
+        await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'writer-added' }), 'utf8');
+        const res = await rollbackTask(stateDir, taskId, wsDir, 'selftest 1.1.1');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'git-hint');
+        eq(res.record.executed, false);
+        assert.equal(await pathExists(path.join(wsDir, 'package.json')), true,
+            'git 模式只返回回滚指令，不清理地基文件');
+    });
+    await ta('1.1.1 场景4：1.1.0 旧 state（无 foundationAtStart 键）→ 回滚跳过地基清理', async () => {
+        const base = path.join(rollbackTmpRoot, 'case4-old-state');
+        const wsDir = path.join(base, 'workspace');
+        const stateDir = path.join(base, 'state');
+        const backupRef = '0123abcd';
+        const backupDir = path.join(stateDir, 'backup', backupRef);
+        await fs.mkdir(wsDir, { recursive: true });
+        await fs.mkdir(backupDir, { recursive: true });
+        await writeWorkspaceMarker(wsDir);
+        const originalPackage = JSON.stringify({ name: 'original-1.1.0', version: '1.0.0' });
+        // 任务开始前的备份（模拟 1.1.0 的 captureRollbackPoint 产物）
+        await fs.writeFile(path.join(backupDir, 'package.json'), originalPackage, 'utf8');
+        // 任务结束后的工作区：写手改过的 package.json（地基文件仍在）
+        await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 'task-modified' }), 'utf8');
+        const taskId = 'selftest-110-old-state';
+        // 1.1.0 WorkflowState 字段集合；rollbackPoint 不含 foundationAtStart（手工构造 JSON，不建 fixture）
+        const oldStateBody = {
+            taskId,
+            taskPrompt: '1.1.0 old state',
+            round: 1,
+            status: 'NEED_HUMAN',
+            writtenFiles: null,
+            testResult: null,
+            reviewResult: null,
+            reviewExcluded: null,
+            secretScanHits: null,
+            rollbackPoint: { mode: 'workspace', ref: backupRef, capturedAt: new Date().toISOString() },
+            rollback: null,
+            lastError: null,
+        };
+        const checksum = StateManager.computeChecksum(oldStateBody);
+        const safeTaskId = taskId.replace(/[^a-zA-Z0-9_\-]/g, '_');
+        const idHash = crypto.createHash('sha256')
+            .update(taskId + '\n' + String(path.resolve(wsDir)))
+            .digest('hex').slice(0, 8);
+        await fs.mkdir(stateDir, { recursive: true });
+        const stateFile = path.join(stateDir, `state_${safeTaskId}_${idHash}.json`);
+        await fs.writeFile(stateFile, JSON.stringify({ version: 1, ...oldStateBody, checksum }, null, 2), 'utf8');
+        const res = await rollbackTask(stateDir, taskId, wsDir, 'selftest 1.1.0 old state');
+        assert.equal(res.success, true, res.message);
+        eq(res.mode, 'workspace-restore');
+        // 断言 ①：旧 state 读出后 rollbackPoint.foundationAtStart 仍为 undefined
+        const persisted = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+        assert.equal(persisted.rollbackPoint.foundationAtStart, undefined);
+        // 断言 ②：回滚后工作区已有 package.json 仍在（跳过地基清理；内容由备份恢复）
+        assert.equal(await pathExists(path.join(wsDir, 'package.json')), true,
+            '1.1.0 旧 state 回滚不应清理已有地基文件');
+        eq(await fs.readFile(path.join(wsDir, 'package.json'), 'utf8'), originalPackage);
+    });
     await ta('状态校验注入点：默认 null → SHA-256 跨调用可回滚；自定义函数可透传', async () => {
         eq(DEFAULT_ENGINE_OPTIONS.stateChecksumFn, null);
         eq(resolveEngineOptions(null).stateChecksumFn, null);

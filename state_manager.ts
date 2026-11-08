@@ -32,6 +32,14 @@ export interface RollbackPoint {
     ref: string;
     /** 捕获时间（ISO 8601）。 */
     capturedAt: string;
+    /**
+     * 任务开始时根级地基文件快照（仅 workspace 模式记录；git 模式不写，保持 undefined）。
+     * 三态语义（rollbackTask 据此清理任务期间新增的根级地基文件，1.1.1）：
+     *  - undefined：1.1.0 旧状态或 git 模式 → 回滚跳过地基清理（保持 1.1.0 行为）；
+     *  - []：任务开始时工作区无地基文件 → 回滚清理所有根级地基文件；
+     *  - 非空数组：只清理不在该清单中的根级地基文件（清单内的保留，内容由备份恢复）。
+     */
+    foundationAtStart?: string[];
 }
 
 /** 回滚执行方式：git-hint＝只给命令提示不执行 git；workspace-restore＝DACW 从备份恢复。 */
@@ -90,6 +98,29 @@ interface PersistedState {
     checksum: string;
 }
 
+/**
+ * checksum 输入的规范化序列化：字段集合与顺序与 1.1.0 完全一致（仅用于校验，不含
+ * checksum / version 这两个文件级字段）。实例校验、静态 computeChecksum 共用此函数，
+ * 保证「写入」「load() 校验」「测试重算」三处输入约定唯一。
+ */
+function serializeChecksumBody(state: WorkflowState): string {
+    const {
+        taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
+        reviewExcluded, secretScanHits, rollbackPoint, rollback, lastError,
+    } = state;
+    return JSON.stringify({
+        taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
+        reviewExcluded: reviewExcluded ?? null,
+        secretScanHits: secretScanHits ?? null,
+        rollbackPoint: rollbackPoint ?? null,
+        rollback: rollback ?? null,
+        lastError,
+    });
+}
+
+/** 内置确定性校验函数：SHA-256（默认；防意外损坏/手滑改写，不防同账号本地用户重算）。 */
+const DEFAULT_CHECKSUM_FN: StateChecksumFn = (body) => crypto.createHash('sha256').update(body).digest('hex');
+
 export class StateManager {
     private stateDir: string;
     private stateFilePath: string;
@@ -115,22 +146,29 @@ export class StateManager {
             .update(String(rawTaskId) + '\n' + String(workspaceDir))
             .digest('hex').slice(0, 8);
         this.taskId = safeTaskId;
-        this.checksumFn = checksumFn ?? ((body) => crypto.createHash('sha256').update(body).digest('hex'));
+        this.checksumFn = checksumFn ?? DEFAULT_CHECKSUM_FN;
         this.stateDir = path.resolve(stateDir);
         this.stateFilePath = path.join(this.stateDir, `state_${safeTaskId}_${idHash}.json`);
     }
 
+    /**
+     * 计算状态校验值（静态、外部可调用；1.1.1 新增，供回归测试 / 审计重算）。
+     *
+     * 输入约定（与 load() 默认校验完全一致）：
+     *   - 入参为 WorkflowState 的 12 个业务字段；**不含 checksum 键**（checksum 是文件级
+     *     字段），version 同为文件级字段、不参与校验；
+     *   - 若传入对象带额外键（如从状态文件读出的 { version, checksum, ... }），序列化时
+     *     只读取上述 12 个字段，与 load() 内 `const { checksum, version, ...state } = parsed`
+     *     的解构行为一致；
+     *   - 固定使用内置 SHA-256（实例 checksumFn 注入点不参与本方法）；注入自定义校验函数
+     *     的调用方请用与写入侧相同的函数重算，不要用本方法。
+     */
+    public static computeChecksum(state: WorkflowState): string {
+        return DEFAULT_CHECKSUM_FN(serializeChecksumBody(state));
+    }
+
     private checksumOf(state: WorkflowState): string {
-        const { taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult, reviewExcluded, secretScanHits, rollbackPoint, rollback, lastError } = state;
-        const body = JSON.stringify({
-            taskId, round, status, taskPrompt, writtenFiles, testResult, reviewResult,
-            reviewExcluded: reviewExcluded ?? null,
-            secretScanHits: secretScanHits ?? null,
-            rollbackPoint: rollbackPoint ?? null,
-            rollback: rollback ?? null,
-            lastError,
-        });
-        return this.checksumFn(body);
+        return this.checksumFn(serializeChecksumBody(state));
     }
 
     private async persist(state: WorkflowState): Promise<void> {

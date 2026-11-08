@@ -57,11 +57,11 @@ DACW 是一个 **DSH Host 插件**：写手子代理按增量协议产出代码�
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
-node selftest.mjs                           # 131 项回归自测
+node selftest.mjs                           # 135 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
-在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.1.0.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——目录安装会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
+在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.1.1.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——目录安装会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
 
 升级：改代码 → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` 同一 tarball → 重启 Harness。
 
@@ -227,7 +227,7 @@ DACW 会执行模型生成的代码与命令。**测试在审查之前执行**�
 
 ## 状态
 
-实验性开发者预览（当前版本 `v1.1.0`，bundle `@stmcw1/dacw`）：构建冒烟与 131 项回归自测通过。默认执行策略为宿主直执（`sandbox.mode: "host"`，无隔离）；`auto`/`docker` 为显式可选（Docker 不可用时 fail-closed / 交互确认，见「沙箱配置」）。**宿主执行闭环验证状态：** v1.1.0 改动了默认执行策略、回滚授权、秘密管控、测试后对账与宿主能力探测，已在 DSH 0.2.2-rc.1 桌面宿主下完成闭环验证：插件激活、`dacw_run` 写手产出 → 测试 → 独立审查 → `NEED_HUMAN`、`dacw_rollback` 工作区恢复、秘密扫描命中拒绝、`userQuestions` 人工确认，五条链路均实测走通。已知限制见 ROADMAP「4b. 已知限制 / 建议优先」。欢迎 issue / PR。
+实验性开发者预览（当前版本 `v1.1.1`，bundle `@stmcw1/dacw`）：构建冒烟与 135 项回归自测通过；`v1.1.1` 为 patch 版本，修复回滚后地基文件残留（兼容 1.1.0 旧 state）。默认执行策略为宿主直执（`sandbox.mode: "host"`，无隔离）；`auto`/`docker` 为显式可选（Docker 不可用时 fail-closed / 交互确认，见「沙箱配置」）。**宿主执行闭环验证状态：** v1.1.0 改动了默认执行策略、回滚授权、秘密管控、测试后对账与宿主能力探测，已在 DSH 0.2.2-rc.1 桌面宿主下完成闭环验证：插件激活、`dacw_run` 写手产出 → 测试 → 独立审查 → `NEED_HUMAN`、`dacw_rollback` 工作区恢复、秘密扫描命中拒绝、`userQuestions` 人工确认，五条链路均实测走通。已知限制见 ROADMAP「4b. 已知限制 / 建议优先」。欢迎 issue / PR。
 
 ## 许可证
 
