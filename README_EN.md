@@ -57,11 +57,11 @@ Build requires Node ≥ 22.13; tests run on the host by default (no isolation, r
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
-node selftest.mjs                           # 131 regression vectors
+node selftest.mjs                           # 135 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
-In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.1.0.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
+In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (for example `file:/absolute/path/to/stmcw1-dacw-1.1.1.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — a directory install bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
 
 Upgrade: edit sources → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` the same tarball → restart the Harness.
 
@@ -225,7 +225,7 @@ See [SAFETY_EN.md](SAFETY_EN.md) for the full boundaries, execution order and di
 
 ## Status
 
-Experimental developer preview (current version `v1.1.0`, bundle `@stmcw1/dacw`): the build smoke check and 131 regression vectors pass. The default execution policy is host (no isolation); `auto`/`docker` are explicit opt-ins (fail-closed / interactive confirmation when Docker is unavailable — see "Sandbox configuration"). **Live host-execution loop status:** v1.1.0 changed the default execution policy, rollback authorization, secret controls, post-test reconciliation and host capability probe, and **has completed the closed-loop verification on the DSH `0.2.2-rc.1` desktop host** (2026-11-06): plugin activation, `dacw_run` writer output → test → independent review → `NEED_HUMAN`, `dacw_rollback` workspace restore, secret-scan hit rejection, and `userQuestions` human confirmation — all five paths measured in effect. Known limitations: see ROADMAP "4b. Known limitations / Prioritized suggestions". Issues and PRs are welcome.
+Experimental developer preview (current version `v1.1.1`, bundle `@stmcw1/dacw`): the build smoke check and 135 regression vectors pass; `v1.1.1` is a patch release fixing leftover root-level foundation files after rollback (compatible with 1.1.0 state). The default execution policy is host (no isolation); `auto`/`docker` are explicit opt-ins (fail-closed / interactive confirmation when Docker is unavailable — see "Sandbox configuration"). **Live host-execution loop status:** v1.1.0 changed the default execution policy, rollback authorization, secret controls, post-test reconciliation and host capability probe, and **has completed the closed-loop verification on the DSH `0.2.2-rc.1` desktop host** (2026-11-06): plugin activation, `dacw_run` writer output → test → independent review → `NEED_HUMAN`, `dacw_rollback` workspace restore, secret-scan hit rejection, and `userQuestions` human confirmation — all five paths measured in effect. Known limitations: see ROADMAP "4b. Known limitations / Prioritized suggestions". Issues and PRs are welcome.
 
 ## License
 
