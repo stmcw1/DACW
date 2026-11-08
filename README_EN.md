@@ -149,7 +149,7 @@ Project layout: `plugin.ts` (Host half), `index.ts` (orchestrator), `runner.ts` 
 
 ## Status
 
-Experimental developer preview (current release `v1.1.1`, bundle `@stmcw1/dacw`): the build smoke check and 135 regression vectors pass; `v1.1.1` fixes leftover root-level foundation files after rollback (compatible with 1.1.0 state). Execution isolation is off by default (`host`). Known limitations: [ROADMAP.md](ROADMAP.md) section "4b". `2.0.0` (engine refactor) is under development on a separate branch.
+Experimental developer preview (current release `v1.1.1`, bundle `@stmcw1/dacw`): the build smoke check and 135 regression vectors pass; `v1.1.1` fixes leftover root-level foundation files after rollback (compatible with 1.1.0 state). Execution isolation is off by default (`host`). Known limitations: [ROADMAP.md](ROADMAP.md) section "4b". `2.0.0` (engine refactor) is planned.
 
 ## License
 

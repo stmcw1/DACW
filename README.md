@@ -149,7 +149,7 @@ node selftest.mjs     # 提交前请执行 build + selftest
 
 ## 状态
 
-实验性开发者预览（当前发布版本 `v1.1.1`，bundle `@stmcw1/dacw`）：构建冒烟与 135 项回归自测通过；`v1.1.1` 修复回滚后地基文件残留（兼容 1.1.0 旧 state）。默认执行隔离关闭（`host`）。已知限制见 [ROADMAP.md](ROADMAP.md)「4b」。`2.0.0`（engine 重构）在独立分支开发中。
+实验性开发者预览（当前发布版本 `v1.1.1`，bundle `@stmcw1/dacw`）：构建冒烟与 135 项回归自测通过；`v1.1.1` 修复回滚后地基文件残留（兼容 1.1.0 旧 state）。默认执行隔离关闭（`host`）。已知限制见 [ROADMAP.md](ROADMAP.md)「4b」。`2.0.0`（engine 重构）在计划中。
 
 ## 许可证
 
