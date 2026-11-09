@@ -8,6 +8,10 @@
 
 # DACW — Defensive Agent Coding Workflow
 
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+[![npm version](https://img.shields.io/npm/v/@stmcw1/dacw.svg)](https://www.npmjs.com/package/@stmcw1/dacw)
+[![Node.js Version](https://img.shields.io/node/v/@stmcw1/dacw.svg)](https://nodejs.org)
+
 Let AI write the code, let machines verify it, and let humans make the final call.
 
 [简体中文](README.md) | English | [Safety](SAFETY_EN.md)
