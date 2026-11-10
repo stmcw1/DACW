@@ -9,6 +9,7 @@
 # DACW — 防御性智能体编程工作流
 
 [![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+[![dsh.so risk](https://cdn.dsh.so/badge/dacw.svg)](https://www.dsh.so/artifact/dacw/?ref=badge)
 [![npm version](https://img.shields.io/npm/v/@stmcw1/dacw.svg)](https://www.npmjs.com/package/@stmcw1/dacw)
 [![Node.js Version](https://img.shields.io/node/v/@stmcw1/dacw.svg)](https://nodejs.org)
 
