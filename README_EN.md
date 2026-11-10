@@ -8,6 +8,11 @@
 
 # DACW — Defensive Agent Coding Workflow
 
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+[![dsh.so risk](https://cdn.dsh.so/badge/dacw.svg)](https://www.dsh.so/artifact/dacw/?ref=badge)
+[![npm version](https://img.shields.io/npm/v/@stmcw1/dacw.svg)](https://www.npmjs.com/package/@stmcw1/dacw)
+[![Node.js Version](https://img.shields.io/node/v/@stmcw1/dacw.svg)](https://nodejs.org)
+
 Let AI write the code, let machines verify it, and let humans make the final call.
 
 [简体中文](README.md) | English | [Safety](SAFETY_EN.md)
@@ -43,7 +48,7 @@ Writer → Orchestrator (validate / merge / write) → Runner (project tests) �
 
 **Prerequisite**: DSH ≥ 0.2.2-rc.1 (current tested version); the host must provide the `ctx.subagents`, `agentPresets` and `tools` services. DACW depends on DSH's official `dsh-persona` and `dsh-subagent-spawn-in-process`; no third-party plugins are required.
 
-Activation probes the required host capabilities and refuses to activate with a "host incompatible" error when any is missing; sandbox and child isolation must be verifiable — any unconfirmable path fails closed. Building requires Node ≥ 22.13; the tested project's dependencies must be installed manually.
+Activation probes the required host capabilities and refuses to activate with a "host incompatible" error when any is missing; sandbox and child isolation must be verifiable — any unconfirmable path fails closed. Building requires Node ≥ 24.9; the tested project's dependencies must be installed manually.
 
 ```bash
 node build.mjs                              # build dist/ (Node built-in type stripping, no typescript)
