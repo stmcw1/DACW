@@ -47,7 +47,7 @@ DACW 是 **DSH Host 插件**：写手子代理按增量协议产出代码 → �
 
 **前置要求**：DSH ≥ 0.2.2-rc.1（实测版本），宿主需提供 `ctx.subagents`、`agentPresets`、`tools` 服务；依赖 DSH 官方 `dsh-persona`、`dsh-subagent-spawn-in-process`，不依赖第三方插件。
 
-激活时探测宿主能力，缺失即报「宿主不兼容」并拒绝激活；sandbox 与子代理隔离必须可验证，无法确认的路径一律 fail-closed。构建需要 Node ≥ 22.13；被测试项目的依赖需人工预装。
+激活时探测宿主能力，缺失即报「宿主不兼容」并拒绝激活；sandbox 与子代理隔离必须可验证，无法确认的路径一律 fail-closed。构建需要 Node ≥ 24.9；被测试项目的依赖需人工预装。
 
 ```bash
 node build.mjs                              # 构建 dist/（Node 内置类型擦除，无需 typescript）
