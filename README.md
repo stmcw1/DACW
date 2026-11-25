@@ -56,7 +56,7 @@ node selftest.mjs                           # 135 项回归自测
 npm pack --pack-destination ../dacw-pack    # 生成安装产物
 ```
 
-在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.1.1.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
+在 DSH 插件管理器中执行 `install_bundle`，target 填 tarball 的绝对路径并加 `file:` 前缀（例如 `file:/absolute/path/to/stmcw1-dacw-1.1.2.tgz`）。安装后向 profile 插入 Host 行 `dacw`（bundle 包名 `@stmcw1/dacw`）。**不要用目录路径安装**——会绕过 `files` 白名单，把源码、测试与构建脚本一并装进 profile。
 
 升级：改代码 → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` 同一 tarball → 重启 Harness。
 
@@ -154,7 +154,7 @@ node selftest.mjs     # 提交前请执行 build + selftest
 
 ## 状态
 
-实验性开发者预览（当前发布版本 `v1.1.1`，bundle `@stmcw1/dacw`）：构建冒烟与 135 项回归自测通过；`v1.1.1` 修复回滚后地基文件残留（兼容 1.1.0 旧 state）。默认执行隔离关闭（`host`）。已知限制见 [ROADMAP.md](ROADMAP.md)「4b」。`2.0.0`（engine 重构）在计划中。
+实验性开发者预览（当前发布版本 `v1.1.2`，bundle `@stmcw1/dacw`）：构建冒烟与 135 项回归自测通过；`v1.1.2` 适配 DSH 0.2.2-rc.5 子代理扁平化契约（修复写手子代理启动失败），`v1.1.1` 修复回滚后地基文件残留（兼容 1.1.0 旧 state）。默认执行隔离关闭（`host`）。已知限制见 [ROADMAP.md](ROADMAP.md)「4b」。`2.0.0`（engine 重构）在计划中。
 
 ## 许可证
 
