@@ -56,7 +56,7 @@ node selftest.mjs                           # 135 regression vectors
 npm pack --pack-destination ../dacw-pack    # produce the install artifact
 ```
 
-In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (e.g. `file:/absolute/path/to/stmcw1-dacw-1.1.1.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — it bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
+In the DSH plugin manager run `install_bundle` with the tarball's absolute path prefixed by `file:` (e.g. `file:/absolute/path/to/stmcw1-dacw-1.1.2.tgz`). Installation inserts Host row `dacw` (bundle package `@stmcw1/dacw`) into the profile. **Do not install with a directory path** — it bypasses the `files` whitelist and ships sources, tests and build scripts into the profile.
 
 Upgrade: edit sources → `node build.mjs` → `npm pack` → `remove_bundle` → `install_bundle` the same tarball → restart the Harness.
 
@@ -154,7 +154,7 @@ Project layout: `plugin.ts` (Host half), `index.ts` (orchestrator), `runner.ts` 
 
 ## Status
 
-Experimental developer preview (current release `v1.1.1`, bundle `@stmcw1/dacw`): the build smoke check and 135 regression vectors pass; `v1.1.1` fixes leftover root-level foundation files after rollback (compatible with 1.1.0 state). Execution isolation is off by default (`host`). Known limitations: [ROADMAP.md](ROADMAP.md) section "4b". `2.0.0` (engine refactor) is planned.
+Experimental developer preview (current release `v1.1.2`, bundle `@stmcw1/dacw`): the build smoke check and 135 regression vectors pass; `v1.1.2` adapts to the DSH 0.2.2-rc.5 flattened subagent contract (fixing writer-subagent startup failure), and `v1.1.1` fixed leftover root-level foundation files after rollback (compatible with 1.1.0 state). Execution isolation is off by default (`host`). Known limitations: [ROADMAP.md](ROADMAP.md) section "4b". `2.0.0` (engine refactor) is planned.
 
 ## License
 
