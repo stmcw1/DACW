@@ -261,27 +261,32 @@ export interface ActivationInput {
 
 /**
  * 构造 `ctx.subagents.startActivation()` 参数（纯函数，供回归自测）。
+ *
+ * DSH 0.2.2-rc.5 的 `SubagentActivationSpec` 已移除嵌套 `request` 字段（升级指南
+ * v0.2.1-rc.2「Subagent activation options」）：`prompt`/`parent`/`cwd`/`agentPreset`/
+ * `agentOptions` 等任务选项必须直接放在 spec 顶层。先展开任务字段，再写
+ * provider/label/signal/delivery，保证激活字段覆盖任何同名任务字段。
  * delivery='caller'：结果作为 promise 返回值交付，不向父会话写完成通知。
  */
 export function buildActivationSpec(input: ActivationInput) {
     const { config, role, text } = input;
-    const request: Record<string, unknown> = {
+    const task: Record<string, unknown> = {
         prompt: [{ type: 'text', text }],
         parent: input.parent,
     };
-    if (typeof input.cwd === 'string' && input.cwd) request.cwd = input.cwd;
-    if (typeof input.presetId === 'string' && input.presetId) request.agentPreset = input.presetId;
+    if (typeof input.cwd === 'string' && input.cwd) task.cwd = input.cwd;
+    if (typeof input.presetId === 'string' && input.presetId) task.agentPreset = input.presetId;
     if (input.model) {
-        request.agentOptions = {
+        task.agentOptions = {
             provider: input.model.provider,
             model: input.model.model,
             ...(input.model.reasoningEffort ? { reasoningEffort: input.model.reasoningEffort } : {}),
         };
     }
     return {
+        ...task,
         provider: config.subagentProvider,
         label: `dacw-${role}`,
-        request,
         signal: input.signal,
         delivery: 'caller' as const,
     };

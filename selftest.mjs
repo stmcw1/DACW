@@ -472,25 +472,25 @@ t('引擎配置：roleModels 合法传入，非法忽略', () => {
 const parent = { id: 'parent-1' };
 const signal = { aborted: false };
 
-t('写手 spec：caller 交付 + 专用 preset + 模型覆盖', () => {
+t('写手 spec：caller 交付 + 专用 preset + 模型覆盖（DSH rc5 平铺契约）', () => {
     const spec = buildActivationSpec({
         config: DEFAULT_PLUGIN_CONFIG, role: 'writer', text: 'write it', parent,
         cwd: 'E:\\work', presetId: 'dacw-writer', signal,
         model: { provider: 'deepseek', model: 'deepseek-chat' },
     });
     eq(spec, {
+        prompt: [{ type: 'text', text: 'write it' }],
+        parent,
+        cwd: 'E:\\work',
+        agentPreset: 'dacw-writer',
+        agentOptions: { provider: 'deepseek', model: 'deepseek-chat' },
         provider: 'spawn',
         label: 'dacw-writer',
-        request: {
-            prompt: [{ type: 'text', text: 'write it' }],
-            parent,
-            cwd: 'E:\\work',
-            agentPreset: 'dacw-writer',
-            agentOptions: { provider: 'deepseek', model: 'deepseek-chat' },
-        },
         signal,
         delivery: 'caller',
     });
+    // DSH 0.2.2-rc.5：SubagentActivationSpec 不再有嵌套 request 字段（startActivation 直接读 spec.parent.id）。
+    assert.equal(Object.prototype.hasOwnProperty.call(spec, 'request'), false);
 });
 t('审查者 spec：继承模式不传 agentOptions', () => {
     const spec = buildActivationSpec({
@@ -498,8 +498,8 @@ t('审查者 spec：继承模式不传 agentOptions', () => {
         cwd: 'E:\\work', presetId: null, signal, model: null,
     });
     assert.equal(spec.label, 'dacw-reviewer');
-    assert.equal(spec.request.agentPreset, undefined);
-    assert.equal(spec.request.agentOptions, undefined);
+    assert.equal(spec.agentPreset, undefined);
+    assert.equal(spec.agentOptions, undefined);
     assert.equal(spec.delivery, 'caller');
 });
 t('spec：模型 reasoningEffort 透传到 agentOptions', () => {
@@ -508,7 +508,7 @@ t('spec：模型 reasoningEffort 透传到 agentOptions', () => {
         cwd: '', presetId: 'dacw-reviewer', signal,
         model: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' },
     });
-    eq(spec.request.agentOptions, { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' });
+    eq(spec.agentOptions, { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' });
 });
 
 // ================= prepareWorkspace：工作区安全闸门（临时目录，不触碰用户数据） =================
