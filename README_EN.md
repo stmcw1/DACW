@@ -46,7 +46,7 @@ Writer → Orchestrator (validate / merge / write) → Runner (project tests) �
 
 ## Install
 
-**Prerequisite**: DSH ≥ 0.2.2-rc.1 (current tested version); the host must provide the `ctx.subagents`, `agentPresets` and `tools` services. DACW depends on DSH's official `dsh-persona` and `dsh-subagent-spawn-in-process`; no third-party plugins are required.
+**Prerequisite**: DSH ≥ 0.2.2-rc.2 (current tested version). 0.2.2-rc.1 uses the legacy nested `request` subagent contract; 0.2.2-rc.2 introduces the flattened contract (DACW 1.1.2+ adapts to it). The host must provide the `ctx.subagents`, `agentPresets` and `tools` services. DACW depends on DSH's official `dsh-persona` and `dsh-subagent-spawn-in-process`; no third-party plugins are required.
 
 Activation probes the required host capabilities and refuses to activate with a "host incompatible" error when any is missing; sandbox and child isolation must be verifiable — any unconfirmable path fails closed. Building requires Node ≥ 24.9; the tested project's dependencies must be installed manually.
 
